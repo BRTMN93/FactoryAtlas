@@ -14,7 +14,7 @@ class FSlateWindowElementList;
 struct FSlateBrush;
 
 /**
- * Draws the Atlas map: every building as one instanced quad per grid cell, radiation, recipe icons, markers, the
+ * Draws the Atlas map: every building as an instanced quad, in height slabs, radiation, recipe icons, markers, the
  * selection and the hover highlight. Used by the game's map screen and by the separate map window, each with its
  * own copy, since GPU buffers belong to one painter. Buffers exist only while something is painting.
  */
@@ -42,12 +42,32 @@ private:
 		int32 NumInstances = 0;
 	};
 
+	/**
+	 * Buildings are drawn in height slabs that span the whole map, lowest first, each sorted by height, so a higher
+	 * building always lands on top of a lower one. Drawn per spatial cell instead, a foundation centred just across
+	 * a cell boundary covered the machines standing on it.
+	 */
+	static constexpr int32 SlabSteps = 32; // Height steps per slab, 8 m
+	static constexpr int32 SlabCount = Atlas::ZMaxValue / SlabSteps + 1;
+	static constexpr int32 SlabWords = (SlabCount + 63) / 64;
+	struct FSlabMask
+	{
+		uint64 Words[SlabWords] = {};
+	};
+	struct FSlab
+	{
+		TSharedPtr<ISlateUpdatableInstanceBuffer> Buffer;
+		int32 NumInstances = 0;
+	};
+
 	bool EnsureMaterial(UAtlasSubsystem& Atlas);
 	void UpdateParameters(UAtlasSubsystem& Atlas);
 	void SetScalar(const TCHAR* Name, float Value);
 	void Upload(UAtlasSubsystem& Atlas);
 	/** Brings Out up to date with Source's cells, uploading only those whose version changed, within Budget. */
 	static void UploadGrid(const Atlas::FGrid& Source, TArray<FCellBuffer>& Out, int64& Budget);
+	/** Brings the building slabs up to date with Source, rebuilding only slabs that a changed cell touched, within Budget. */
+	void UploadSlabs(const Atlas::FGrid& Source, int64& Budget);
 	/** Draws each cell of Buffers that is on screen with one call. Returns the number of instances drawn. */
 	int64 DrawCells(const TArray<FCellBuffer>& Buffers, const FSlateResourceHandle& Handle, FSlateWindowElementList& OutDrawElements, int32 Layer,
 		const TArray<FSlateVertex>& Vertices, FVector2f Origin, FVector2f Scale, const FSlateRect& CullingRect) const;
@@ -63,9 +83,22 @@ private:
 	/** In wire mode: the wire being run, from its start to the building or ground under the cursor. */
 	int32 PaintWire(const UAtlasSubsystem& Atlas, Atlas::EView View, FSlateWindowElementList& OutDrawElements, int32 LayerId,
 		FVector2f Origin, FVector2f Scale) const;
+	/** In place mode: the building in hand as a ghost of its footprint, where the game's hologram has it. */
+	int32 PaintPlace(const UAtlasSubsystem& Atlas, Atlas::EView View, FSlateWindowElementList& OutDrawElements, int32 LayerId,
+		FVector2f Origin, FVector2f Scale) const;
 
-	TArray<FCellBuffer> Cells;
+	TArray<FSlab> Slabs;
+	/** Per grid cell: the version last read, and which slabs its records were in then. */
+	TArray<uint32> CellVersions;
+	TArray<FSlabMask> CellSlabs;
+	FSlabMask DirtySlabs;
 	TArray<FCellBuffer> StatusCells;
+	TSharedPtr<ISlateUpdatableInstanceBuffer> DismantleBuffer;
+	uint32 DismantleVersion = 0;
+	int32 DismantleCount = 0;
+	TSharedPtr<ISlateUpdatableInstanceBuffer> UpgradeBuffer;
+	uint32 UpgradeVersion = 0;
+	int32 UpgradeCount = 0;
 	TSharedPtr<ISlateUpdatableInstanceBuffer> HitsBuffer;
 	uint32 HitsVersion = 0;
 	int32 HitsCount = 0;

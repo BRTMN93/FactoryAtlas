@@ -456,9 +456,15 @@ bool UAtlasSubsystem::CanBuildBelts() const
 
 void UAtlasSubsystem::SetMapCursor(EView View, FVector2f Uv, float PixelsPerMetre)
 {
+	// Not painted for a while means the view was closed, so this paint is it opening again.
+	const bool bOpened = GFrameCounter - MapPaintFrame[int32(View)] > 30;
 	MapCursorUv[int32(View)] = Uv;
 	MapCursorPixelsPerMetre[int32(View)] = PixelsPerMetre;
 	MapPaintFrame[int32(View)] = GFrameCounter;
+	if (bOpened)
+	{
+		OnMapOpened(View);
+	}
 }
 
 void UAtlasSubsystem::RebuildPorts()
@@ -504,6 +510,14 @@ bool UAtlasSubsystem::IsPortShown(const FPort& Port)
 	const UFGConnectionComponent* Connection = Port.Connection.Get();
 	AFGBuildable* Owner = Port.Owner.Get();
 	if (!Connection || !Owner || IsPortConnected(Connection))
+	{
+		return false;
+	}
+	const bool bKindShown = Port.Kind == EPortKind::Belt ? Settings.bBeltPorts
+		: Port.Kind == EPortKind::Pipe ? Settings.bPipePorts
+		: Port.Kind == EPortKind::Hypertube ? Settings.bHypertubePorts
+		: Settings.bRailPorts;
+	if (!bKindShown)
 	{
 		return false;
 	}
@@ -643,6 +657,7 @@ bool UAtlasSubsystem::ReleaseBeltPress()
 
 void UAtlasSubsystem::CancelBeltDrag()
 {
+	bBeltAuto = false;
 	if (BeltTicker.IsValid())
 	{
 		FTSTicker::GetCoreTicker().RemoveTicker(BeltTicker);
@@ -928,30 +943,40 @@ bool UAtlasSubsystem::TickBelt()
 		return false;
 	}
 
-	// The target follows the cursor every frame; a new one needs a moment before its verdict counts.
-	const int32 Index = GetPortUnderCursor(BeltDrag.View);
-	const bool bHasTarget = Index != INDEX_NONE;
-	const TArray<FPort>& Shown = GetPorts();
-	const bool bChanged = bHasTarget != BeltDrag.bHasTarget || (bHasTarget && Shown[Index].Connection != BeltDrag.Target.Connection);
-	BeltDrag.bHasTarget = bHasTarget;
-	if (bHasTarget)
+	// The target follows the cursor every frame; a new one needs a moment before its verdict counts. An automatic
+	// line keeps the target it was given.
+	if (!bBeltAuto)
 	{
-		BeltDrag.Target = Shown[Index];
-		BeltDrag.bHasGround = false;
-	}
-	if (bChanged)
-	{
-		BeltSettleFrames = SettleFrames;
-		BeltDrag.bReady = false;
+		const int32 Index = GetPortUnderCursor(BeltDrag.View);
+		const bool bHasTarget = Index != INDEX_NONE;
+		const TArray<FPort>& Shown = GetPorts();
+		const bool bChanged = bHasTarget != BeltDrag.bHasTarget || (bHasTarget && Shown[Index].Connection != BeltDrag.Target.Connection);
+		BeltDrag.bHasTarget = bHasTarget;
 		if (bHasTarget)
 		{
-			BeltDrag.Points.Reset(); // Leaving a port keeps the free preview until the next frame replaces it
+			BeltDrag.Target = Shown[Index];
+			BeltDrag.bHasGround = false;
+		}
+		if (bChanged)
+		{
+			BeltSettleFrames = SettleFrames;
+			BeltDrag.bReady = false;
+			if (bHasTarget)
+			{
+				BeltDrag.Points.Reset(); // Leaving a port keeps the free preview until the next frame replaces it
+			}
 		}
 	}
 
 	AFGSplineHologram* Spline = Cast<AFGSplineHologram>(BeltHologram.Get());
 	if (BeltStage < 0 || !Spline)
 	{
+		if (bBeltAuto)
+		{
+			FinishAutoBelt();
+			BeltTicker.Reset();
+			return false;
+		}
 		return true; // Failed to start; the reason is showing, and release cancels
 	}
 	if (--BeltWaitFrames > 0)
@@ -1037,8 +1062,57 @@ bool UAtlasSubsystem::TickBelt()
 			return true;
 		}
 		ValidateBelt();
+		if (bBeltAuto && BeltDrag.bReady)
+		{
+			FinishAutoBelt();
+			BeltTicker.Reset();
+			return false;
+		}
 		return true;
 	}
+}
+
+bool UAtlasSubsystem::StartAutoBelt(const FPort& Start, const FPort& Target)
+{
+	CancelBeltDrag();
+	BeltDrag = FBeltDrag();
+	BeltDrag.bPressed = true;
+	BeltDrag.bActive = true;
+	BeltDrag.View = Place.View;
+	BeltDrag.Start = Start;
+	BeltDrag.Target = Target;
+	BeltDrag.bHasTarget = true;
+	BeltHitVariant = 0;
+	bBeltAuto = true;
+	SpawnBeltHologram();
+	if (!BeltTicker.IsValid())
+	{
+		BeltTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateWeakLambda(this, [this](float) { return TickBelt(); }));
+	}
+	return true;
+}
+
+void UAtlasSubsystem::FinishAutoBelt()
+{
+	if (BeltDrag.bValid && BeltDrag.bReady)
+	{
+		BuildBelt();
+		Place.ManifoldBelts++;
+	}
+	else
+	{
+		Place.ManifoldFailed++;
+		if (Place.ManifoldReason.IsEmpty())
+		{
+			Place.ManifoldReason = BeltDrag.Reason.IsEmpty() ? FText::FromString(TEXT("A belt couldn't be built.")) : BeltDrag.Reason;
+		}
+		UE_LOG(LogFactoryAtlas, Display, TEXT("Manifold: belt from %s to %s refused: %s"), *GetNameSafe(BeltDrag.Start.Owner.Get()),
+			*GetNameSafe(BeltDrag.Target.Owner.Get()), *BeltDrag.Reason.ToString());
+	}
+	// The ticker that called this is told to stop by its return value, so only the hologram and state go here.
+	DestroyBeltHologram();
+	BeltDrag = FBeltDrag();
+	bBeltAuto = false;
 }
 
 void UAtlasSubsystem::BuildBelt()
@@ -1101,6 +1175,11 @@ void UAtlasSubsystem::BuildBelt()
 	if (!PayBuildCost(Cost))
 	{
 		UE_LOG(LogFactoryAtlas, Warning, TEXT("Belt: built %s but couldn't take its whole cost"), *Built->GetName());
+	}
+	// A manifold's belts join its row's blueprint group.
+	if (bBeltAuto && PlaceGroup.IsValid())
+	{
+		GroupPlaced(Built, Built->GetClass(), false, Built->GetActorTransform());
 	}
 	UE_LOG(LogFactoryAtlas, Display, TEXT("Belt: built %s from %s to %s%s"), *Built->GetName(),
 		*GetNameSafe(BeltDrag.Start.Owner.Get()), BeltDrag.bHasTarget ? *GetNameSafe(BeltDrag.Target.Owner.Get()) : TEXT("the ground"),

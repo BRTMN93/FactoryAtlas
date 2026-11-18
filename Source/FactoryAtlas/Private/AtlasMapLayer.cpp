@@ -1,6 +1,7 @@
 #include "AtlasMapLayer.h"
 
 #include "AtlasMapWindow.h"
+#include "AtlasRealistic.h"
 #include "AtlasSubsystem.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/Image.h"
@@ -27,6 +28,7 @@ void UAtlasMapLayer::NativeConstruct()
 	if (UAtlasSubsystem* Atlas = UAtlasSubsystem::GetActive())
 	{
 		Atlas->OnMapOpened();
+		Atlas->MinimizePanelForBasic();
 	}
 
 	// The hook places this layer inside Widget_Map, which sits inside Widget_MapContainer. Both hold mMaxZoom.
@@ -62,6 +64,7 @@ void UAtlasMapLayer::NativeDestruct()
 	{
 		Atlas->ClearHover(EView::Game);
 		Atlas->SetPointerOverPanel(false, EView::Game);
+		Atlas->OnMapClosed(EView::Game);
 	}
 	Super::NativeDestruct();
 }
@@ -92,7 +95,7 @@ void UAtlasMapLayer::UpdateHover(UAtlasSubsystem& Atlas, const FGeometry& Geomet
 {
 	const FSettings& Settings = Atlas.GetSettings();
 	// Wire mode finds the building to connect through the hover, so it needs it even with the label and highlight off.
-	if (!Settings.bHoverLabel && !Settings.bHighlight && !Atlas.IsWiring(EView::Game))
+	if (!Settings.bHoverLabel && !Settings.bHighlight && !Atlas.IsWiring(EView::Game) && !Atlas.IsPlacing(EView::Game))
 	{
 		Atlas.ClearHover(EView::Game);
 		return;
@@ -125,13 +128,13 @@ void UAtlasMapLayer::UpdateHover(UAtlasSubsystem& Atlas, const FGeometry& Geomet
 int32 UAtlasMapLayer::NativePaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
 	FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
 {
-	const int32 Layer = Super::NativePaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
+	const int32 SuperLayer = Super::NativePaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
 
 	UAtlasSubsystem* Atlas = UAtlasSubsystem::GetActive();
 	UAtlasMapLayer* Self = const_cast<UAtlasMapLayer*>(this);
 	if (!Atlas)
 	{
-		return Layer;
+		return SuperLayer;
 	}
 
 	// The first paint is the first moment the map is really on screen, so a map that is never
@@ -158,6 +161,30 @@ int32 UAtlasMapLayer::NativePaint(const FPaintArgs& Args, const FGeometry& Allot
 	// For the HUD, which draws the measure tool over this map. Same space as the selection anchor below.
 	Atlas->SetMapTransform(EView::Game, Origin, Scale);
 
+	// The realistic imagery covers the game's map image, which sits just beneath this layer and shows through
+	// until the first tiles are ready. The game's own map icons stay on top of both.
+	int32 Layer = SuperLayer;
+	bool bRealistic = false;
+	if (Atlas->GetSettings().bRealisticTerrain)
+	{
+		const int32 Drawn = Realistic::Paint(Origin, Scale, MyCullingRect, OutDrawElements, Layer + 1);
+		if (Drawn != INDEX_NONE)
+		{
+			Layer = Drawn;
+			bRealistic = true;
+		}
+	}
+	// Credited on top of everything, as the permission to use the imagery asks.
+	const auto Finish = [&](int32 Last)
+	{
+		if (bRealistic)
+		{
+			Realistic::PaintCredit(MyCullingRect, AllottedGeometry.Scale, OutDrawElements, Last + 1);
+			return Last + 2;
+		}
+		return Last;
+	};
+
 	// The configure panel follows the selected building as the map pans and zooms.
 	if (Atlas->HasSelection())
 	{
@@ -173,8 +200,8 @@ int32 UAtlasMapLayer::NativePaint(const FPaintArgs& Args, const FGeometry& Allot
 
 	if (!FAtlasMapPainter::HasAnythingToDraw(*Atlas))
 	{
-		return Layer;
+		return Finish(Layer);
 	}
 	Self->UpdateHover(*Atlas, AllottedGeometry, PixelsPerMetre);
-	return Self->Painter.Paint(*Atlas, EView::Game, Origin, Scale, MyCullingRect, OutDrawElements, Layer, Atlas->GetHoverView() == EView::Game, TEXT("Paint"));
+	return Finish(Self->Painter.Paint(*Atlas, EView::Game, Origin, Scale, MyCullingRect, OutDrawElements, Layer, Atlas->GetHoverView() == EView::Game, TEXT("Paint")));
 }

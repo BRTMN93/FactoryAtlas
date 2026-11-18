@@ -11,7 +11,13 @@
 #include "AtlasBuildShared.h"
 #include "AtlasTypes.h"
 #include "Buildables/FGBuildable.h"
+#include "Buildables/FGBuildableBlueprintDesigner.h"
+#include "Buildables/FGBuildableCircuitBridge.h"
+#include "Buildables/FGBuildablePowerPole.h"
 #include "Buildables/FGBuildableWire.h"
+#include "FGCentralStorageSubsystem.h"
+#include "FGInventoryComponent.h"
+#include "FGPowerConnectionComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Engine/World.h"
 #include "Equipment/FGBuildGun.h"
@@ -205,6 +211,8 @@ void UAtlasSubsystem::SetWiring(EView View, bool bOn)
 		SetWiring(Wire.View, false);
 	}
 	SetMeasuring(View, false);
+	SetPlacing(Place.View, false);
+	SetDismantling(Dismantle.View, false);
 	CancelBeltDrag();
 	Wire = FWireTool();
 	Wire.bMode = true;
@@ -691,4 +699,568 @@ void UAtlasSubsystem::BuildWire()
 		ShowToast(FText::Format(FText::FromString(TEXT("Built {0}. That end has no free connection, so the chain stops.")), Name));
 		DropWire();
 	}
+}
+
+// Connect mode (Alt+C): pick buildings as dismantle mode does, and Atlas plans the power lines that put them all on
+// one circuit. The plan is a minimum spanning tree over the picked buildings, which keeps the wiring short and its
+// wires from crossing, with a few rules on top so it reads like hand wiring and never strands anything:
+// - Buildings already on the same circuit are one group, so no wire is built that would change nothing.
+// - Each building only looks at its nearest neighbours in reach, and a wire scores a little longer the more diagonal
+//   it runs and a little shorter when it reaches a power pole, so rows chain straight and poles become hubs.
+// - A connection's free slots are respected, and a join that would use up a group's last free slot while other
+//   groups still wait is put off until nothing else is left.
+// The wires are then spawned directly between the two connections, as SmartMCP does, and paid like the build gun's.
+namespace AtlasConnectDetail
+{
+	constexpr int32 Neighbours = 10;          // Candidate wires kept per building, nearest first
+	constexpr double PoleBonus = 0.85;        // A wire to a power pole scores this much of its length
+	constexpr double DiagonalPenalty = 0.1;   // A 45 degree wire scores this much longer than a straight one
+	constexpr double ReachSlackCm = 2000.0;   // Buildings are first compared by their middles, ports can be this far off
+
+	struct FWirePort
+	{
+		UFGPowerConnectionComponent* Component = nullptr;
+		FVector Location = FVector::ZeroVector;
+		EPowerConnectionType Type = EPowerConnectionType::PCT_Default;
+		int32 Free = 0;
+		float Bias = 0.f;
+	};
+
+	struct FWireNode
+	{
+		int32 Target = INDEX_NONE;
+		AFGBuildable* Actor = nullptr;
+		AFGBuildableBlueprintDesigner* Designer = nullptr;
+		FVector Location = FVector::ZeroVector;
+		TArray<FWirePort> Ports;
+		bool bPole = false;
+		bool bTower = false;
+	};
+
+	struct FWireEdge
+	{
+		int32 A = 0;
+		int32 B = 0;
+		double Score = 0.0;
+	};
+
+	/** Groups that are already, or will be, on one circuit, with how many free connection slots each has left. */
+	struct FWireGroups
+	{
+		TArray<int32> Parent;
+		TArray<int32> Free;
+		TArray<int32> Size;
+		int32 Count = 0;
+
+		explicit FWireGroups(const TArray<FWireNode>& Nodes)
+		{
+			Count = Nodes.Num();
+			for (int32 Index = 0; Index < Nodes.Num(); Index++)
+			{
+				Parent.Add(Index);
+				Size.Add(1);
+				int32 Slots = 0;
+				for (const FWirePort& Port : Nodes[Index].Ports)
+				{
+					Slots += FMath::Max(0, Port.Free);
+				}
+				Free.Add(Slots);
+			}
+		}
+
+		int32 Find(int32 Index)
+		{
+			while (Parent[Index] != Index)
+			{
+				Parent[Index] = Parent[Parent[Index]];
+				Index = Parent[Index];
+			}
+			return Index;
+		}
+
+		/** Joins two groups; UsedSlots is what the joining wire takes from them. */
+		void Join(int32 A, int32 B, int32 UsedSlots)
+		{
+			A = Find(A);
+			B = Find(B);
+			if (A == B)
+			{
+				return;
+			}
+			if (Size[A] < Size[B])
+			{
+				Swap(A, B);
+			}
+			Parent[B] = A;
+			Size[A] += Size[B];
+			Free[A] += Free[B] - UsedSlots;
+			Count--;
+		}
+	};
+
+	bool Compatible(EPowerConnectionType A, EPowerConnectionType B)
+	{
+		return A == B || A == EPowerConnectionType::PCT_Any || B == EPowerConnectionType::PCT_Any;
+	}
+
+	/** The free, compatible pair of connections that a wire would join, nearest first, within the game's reach. */
+	bool BestPorts(const FWireNode& A, const FWireNode& B, const AFGBuildableWire& Defaults, int32& OutA, int32& OutB, double& OutLength)
+	{
+		double Best = TNumericLimits<double>::Max();
+		OutA = OutB = INDEX_NONE;
+		for (int32 IndexA = 0; IndexA < A.Ports.Num(); IndexA++)
+		{
+			const FWirePort& PortA = A.Ports[IndexA];
+			if (PortA.Free <= 0)
+			{
+				continue;
+			}
+			for (int32 IndexB = 0; IndexB < B.Ports.Num(); IndexB++)
+			{
+				const FWirePort& PortB = B.Ports[IndexB];
+				if (PortB.Free <= 0 || !Compatible(PortA.Type, PortB.Type))
+				{
+					continue;
+				}
+				const bool bTower = PortA.Type == EPowerConnectionType::PCT_PowerTower || PortB.Type == EPowerConnectionType::PCT_PowerTower;
+				const double Length = FVector::Dist(PortA.Location, PortB.Location);
+				if (Length > (bTower ? Defaults.mMaxPowerTowerLength : Defaults.mMaxLength))
+				{
+					continue;
+				}
+				const double Score = Length + PortA.Bias + PortB.Bias;
+				if (Score < Best)
+				{
+					Best = Score;
+					OutA = IndexA;
+					OutB = IndexB;
+					OutLength = Length;
+				}
+			}
+		}
+		return OutA != INDEX_NONE;
+	}
+
+	/** The wire class an unlocked power line recipe builds, for its reach and cost per length. */
+	const AFGBuildableWire* WireDefaults(TSubclassOf<UFGRecipe> Recipe, TSubclassOf<AFGBuildableWire>& OutClass)
+	{
+		OutClass = nullptr;
+		const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
+		if (Products.IsEmpty() || !Products[0].ItemClass || !Products[0].ItemClass->IsChildOf(UFGBuildingDescriptor::StaticClass()))
+		{
+			return nullptr;
+		}
+		const TSubclassOf<AFGBuildable> Buildable = UFGBuildingDescriptor::GetBuildableClass(TSubclassOf<UFGBuildingDescriptor>(Products[0].ItemClass));
+		if (!Buildable || !Buildable->IsChildOf(AFGBuildableWire::StaticClass()))
+		{
+			return nullptr;
+		}
+		OutClass = TSubclassOf<AFGBuildableWire>(Buildable.Get());
+		return GetDefault<AFGBuildableWire>(Buildable.Get());
+	}
+
+	/** "84 Cable, 12 Quickwire", largest first. */
+	FString DescribeCost(const TMap<UClass*, int32>& Totals)
+	{
+		TArray<TPair<UClass*, int32>> Sorted;
+		for (const TPair<UClass*, int32>& Pair : Totals)
+		{
+			Sorted.Add(Pair);
+		}
+		Sorted.Sort([](const TPair<UClass*, int32>& A, const TPair<UClass*, int32>& B) { return A.Value > B.Value; });
+		TArray<FString> Parts;
+		for (const TPair<UClass*, int32>& Pair : Sorted)
+		{
+			Parts.Add(FString::Printf(TEXT("%d %s"), Pair.Value, *UFGItemDescriptor::GetItemName(TSubclassOf<UFGItemDescriptor>(Pair.Key)).ToString()));
+		}
+		return FString::Join(Parts, TEXT(", "));
+	}
+}
+
+bool UAtlasSubsystem::IsWirable(const AFGBuildable* Building)
+{
+	if (!IsValid(Building) || Building->IsA<AFGBuildableWire>() || Building->IsA<AFGBuildableCircuitBridge>())
+	{
+		return false;
+	}
+	TInlineComponentArray<UFGPowerConnectionComponent*> Connections(Building);
+	for (const UFGPowerConnectionComponent* Connection : Connections)
+	{
+		if (Connection && !Connection->IsHidden())
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void UAtlasSubsystem::PlanPower()
+{
+	using namespace AtlasConnectDetail;
+	FPowerPlan& Plan = Dismantle.Power;
+	Plan = FPowerPlan();
+	const TArray<FDismantleTarget>& Targets = Dismantle.Targets;
+	if (Dismantle.Purpose != EPickPurpose::Power || Targets.IsEmpty())
+	{
+		return;
+	}
+	Plan.Stranded.Init(false, Targets.Num());
+
+	UWorld* World = GetWorld();
+	TSubclassOf<AFGBuildableWire> WireClass;
+	const TSubclassOf<UFGRecipe> Recipe = WireRecipe(World);
+	const AFGBuildableWire* Defaults = WireDefaults(Recipe, WireClass);
+	if (!Defaults)
+	{
+		Plan.ShortText = TEXT("No power line unlocked yet.");
+		return;
+	}
+
+	// Every picked building with a connection a wire can reach.
+	TArray<FWireNode> Nodes;
+	for (int32 Index = 0; Index < Targets.Num(); Index++)
+	{
+		AFGBuildable* Building = Targets[Index].Actor.Get();
+		if (!IsWirable(Building))
+		{
+			continue;
+		}
+		FWireNode Node;
+		Node.Target = Index;
+		Node.Actor = Building;
+		Node.Designer = Building->GetBlueprintDesigner();
+		Node.Location = Building->GetActorLocation();
+		Node.bPole = Building->IsA<AFGBuildablePowerPole>();
+		TInlineComponentArray<UFGPowerConnectionComponent*> Connections(Building);
+		for (UFGPowerConnectionComponent* Connection : Connections)
+		{
+			if (Connection && !Connection->IsHidden())
+			{
+				FWirePort Port;
+				Port.Component = Connection;
+				Port.Location = Connection->GetComponentLocation();
+				Port.Type = Connection->GetPowerConnectionType();
+				Port.Free = Connection->GetNumFreeConnections();
+				Port.Bias = Connection->GetConnectionDistanceBias();
+				Node.bTower |= Port.Type == EPowerConnectionType::PCT_PowerTower;
+				Node.Ports.Add(Port);
+			}
+		}
+		Nodes.Add(MoveTemp(Node));
+	}
+	Plan.Buildings = Nodes.Num();
+	if (Nodes.IsEmpty())
+	{
+		return;
+	}
+
+	// Buildings already on one circuit are one group.
+	FWireGroups Circuits(Nodes);
+	TMap<int32, int32> FirstOnCircuit;
+	for (int32 Index = 0; Index < Nodes.Num(); Index++)
+	{
+		for (const FWirePort& Port : Nodes[Index].Ports)
+		{
+			const int32 Circuit = Port.Component->GetCircuitID();
+			if (Circuit == INDEX_NONE)
+			{
+				continue;
+			}
+			if (const int32* First = FirstOnCircuit.Find(Circuit))
+			{
+				Circuits.Join(*First, Index, 0);
+			}
+			else
+			{
+				FirstOnCircuit.Add(Circuit, Index);
+			}
+		}
+	}
+	Plan.GroupsBefore = Circuits.Count;
+
+	// Candidate wires: each building to its nearest neighbours in other groups, as far as a wire reaches.
+	TArray<FWireEdge> Edges;
+	TSet<uint64> Seen;
+	TArray<TPair<double, int32>> Near;
+	for (int32 A = 0; A < Nodes.Num() && Circuits.Count > 1; A++)
+	{
+		Near.Reset();
+		const int32 GroupA = Circuits.Find(A);
+		for (int32 B = 0; B < Nodes.Num(); B++)
+		{
+			if (B == A || Circuits.Find(B) == GroupA || Nodes[B].Designer != Nodes[A].Designer)
+			{
+				continue;
+			}
+			const double Reach = (Nodes[A].bTower && Nodes[B].bTower ? Defaults->mMaxPowerTowerLength : Defaults->mMaxLength) + ReachSlackCm;
+			const double DistanceSquared = FVector::DistSquared(Nodes[A].Location, Nodes[B].Location);
+			if (DistanceSquared <= Reach * Reach)
+			{
+				Near.Add({ DistanceSquared, B });
+			}
+		}
+		Near.Sort([](const TPair<double, int32>& X, const TPair<double, int32>& Y) { return X.Key < Y.Key; });
+		for (int32 Index = 0; Index < Near.Num() && Index < Neighbours; Index++)
+		{
+			const int32 B = Near[Index].Value;
+			const uint64 Key = (uint64(uint32(FMath::Min(A, B))) << 32) | uint32(FMath::Max(A, B));
+			if (Seen.Contains(Key))
+			{
+				continue;
+			}
+			Seen.Add(Key);
+			int32 PortA, PortB;
+			double Length = 0.0;
+			if (!BestPorts(Nodes[A], Nodes[B], *Defaults, PortA, PortB, Length))
+			{
+				continue;
+			}
+			const FVector Delta = Nodes[B].Ports[PortB].Location - Nodes[A].Ports[PortA].Location;
+			const double Long = FMath::Max(FMath::Abs(Delta.X), FMath::Abs(Delta.Y));
+			const double Diagonal = Long > 1.0 ? FMath::Min(FMath::Abs(Delta.X), FMath::Abs(Delta.Y)) / Long : 0.0;
+			double Score = Length * (1.0 + DiagonalPenalty * Diagonal);
+			if (Nodes[A].bPole || Nodes[B].bPole)
+			{
+				Score *= PoleBonus;
+			}
+			Edges.Add({ A, B, Score });
+		}
+	}
+	Edges.Sort([](const FWireEdge& X, const FWireEdge& Y) { return X.Score < Y.Score; });
+
+	// Shortest first, as long as both ends still have a free slot. The first pass won't leave a group without a free
+	// slot while others still wait to join it; the second takes whatever is left.
+	TArray<bool> Taken;
+	Taken.Init(false, Edges.Num());
+	for (int32 Pass = 0; Pass < 2 && Circuits.Count > 1; Pass++)
+	{
+		for (int32 Index = 0; Index < Edges.Num() && Circuits.Count > 1; Index++)
+		{
+			const FWireEdge& Edge = Edges[Index];
+			const int32 GroupA = Circuits.Find(Edge.A);
+			const int32 GroupB = Circuits.Find(Edge.B);
+			if (Taken[Index] || GroupA == GroupB)
+			{
+				continue;
+			}
+			int32 PortA, PortB;
+			double Length = 0.0;
+			if (!BestPorts(Nodes[Edge.A], Nodes[Edge.B], *Defaults, PortA, PortB, Length))
+			{
+				continue;
+			}
+			if (Pass == 0 && Circuits.Count > 2 && Circuits.Free[GroupA] + Circuits.Free[GroupB] - 2 <= 0)
+			{
+				continue;
+			}
+			Taken[Index] = true;
+			FWirePort& From = Nodes[Edge.A].Ports[PortA];
+			FWirePort& To = Nodes[Edge.B].Ports[PortB];
+			From.Free--;
+			To.Free--;
+			Circuits.Join(GroupA, GroupB, 2);
+
+			FPlannedWire Line;
+			Line.From = From.Component;
+			Line.To = To.Component;
+			Line.FromLocation = From.Location;
+			Line.ToLocation = To.Location;
+			Line.Metres = float(Length / 100.0);
+			const int32 Multiplier = AFGBuildable::GetCostMultiplierForLength(float(Length), Defaults->mLengthPerCost);
+			for (const FItemAmount& Item : UFGRecipe::GetIngredients(World, Recipe))
+			{
+				if (Item.ItemClass && Item.Amount > 0)
+				{
+					Line.Cost.Add(FItemAmount(Item.ItemClass, Item.Amount * Multiplier));
+				}
+			}
+			Plan.Metres += Line.Metres;
+			Plan.Wires.Add(MoveTemp(Line));
+		}
+	}
+	Plan.GroupsAfter = Circuits.Count;
+
+	// Whatever isn't in the biggest group once built is out of reach, and drawn red.
+	if (Circuits.Count > 1)
+	{
+		int32 Biggest = Circuits.Find(0);
+		for (int32 Index = 0; Index < Nodes.Num(); Index++)
+		{
+			const int32 Group = Circuits.Find(Index);
+			if (Circuits.Size[Group] > Circuits.Size[Biggest])
+			{
+				Biggest = Group;
+			}
+		}
+		for (int32 Index = 0; Index < Nodes.Num(); Index++)
+		{
+			Plan.Stranded[Nodes[Index].Target] = Circuits.Find(Index) != Biggest;
+		}
+	}
+
+	// What it costs, and how far the inventory and the Dimensional Depot go, wire by wire in build order.
+	AFGCharacterPlayer* Player = BeltPlayer();
+	UFGInventoryComponent* Inventory = Player && Player->GetBuildGun() ? Player->GetBuildGun()->GetInventory() : nullptr;
+	const AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World);
+	const bool bFree = !Inventory || Inventory->GetNoBuildCost();
+	TMap<UClass*, int32> Totals;
+	bool bShort = false;
+	for (const FPlannedWire& Planned : Plan.Wires)
+	{
+		for (const FItemAmount& Item : Planned.Cost)
+		{
+			int32& Total = Totals.FindOrAdd(Item.ItemClass);
+			Total += Item.Amount;
+			if (!bFree && !bShort)
+			{
+				const int32 Have = Inventory->GetNumItems(Item.ItemClass) + (Depot ? Depot->GetNumItemsFromCentralStorage(Item.ItemClass) : 0);
+				if (Total > Have)
+				{
+					bShort = true;
+					Plan.ShortText = FString::Printf(TEXT("Not enough %s: builds the first %d"), *UFGItemDescriptor::GetItemName(Item.ItemClass).ToString(), Plan.Affordable);
+				}
+			}
+		}
+		if (!bShort)
+		{
+			Plan.Affordable++;
+		}
+	}
+	if (!bFree)
+	{
+		Plan.CostText = DescribeCost(Totals);
+	}
+}
+
+void UAtlasSubsystem::ConnectPicked()
+{
+	using namespace AtlasConnectDetail;
+	if (!Dismantle.bMode || Dismantle.Purpose != EPickPurpose::Power)
+	{
+		return;
+	}
+	const FPowerPlan& Plan = Dismantle.Power;
+	if (Plan.Wires.IsEmpty())
+	{
+		const TCHAR* Why = Plan.Buildings == 0 ? TEXT("Nothing picked. Click buildings or drag a box over them first.")
+			: Plan.GroupsBefore <= 1 ? TEXT("Everything picked is already on one power circuit.")
+			: !Plan.ShortText.IsEmpty() ? *Plan.ShortText
+			: TEXT("Nothing here can be joined: too far apart, or no free connections. A power pole between them helps.");
+		ShowToast(FText::FromString(Why), Plan.GroupsBefore > 1 || Plan.Buildings == 0);
+		PlayClipboardSound(EClipboardSound::Error);
+		return;
+	}
+	UWorld* World = GetWorld();
+	AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(World);
+	AFGCharacterPlayer* Player = BeltPlayer();
+	UFGInventoryComponent* Inventory = Player && Player->GetBuildGun() ? Player->GetBuildGun()->GetInventory() : nullptr;
+	TSubclassOf<AFGBuildableWire> WireClass;
+	const TSubclassOf<UFGRecipe> Recipe = WireRecipe(World);
+	if (!CanBuildBelts() || !Buildables || !Inventory || !WireDefaults(Recipe, WireClass) || !WireClass)
+	{
+		ShowToast(FText::FromString(TEXT("Power lines can only be built from the map in single player or as the host.")), true);
+		PlayClipboardSound(EClipboardSound::Error);
+		return;
+	}
+	const AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World);
+	const bool bFree = Inventory->GetNoBuildCost();
+	const auto CanPay = [Inventory, Depot](const TArray<FItemAmount>& Cost)
+	{
+		for (const FItemAmount& Item : Cost)
+		{
+			if (Inventory->GetNumItems(Item.ItemClass) + (Depot ? Depot->GetNumItemsFromCentralStorage(Item.ItemClass) : 0) < Item.Amount)
+			{
+				return false;
+			}
+		}
+		return true;
+	};
+
+	int32 BuiltCount = 0;
+	int32 Skipped = 0;
+	float Metres = 0.f;
+	bool bShort = false;
+	for (const FPlannedWire& Planned : Plan.Wires)
+	{
+		UFGCircuitConnectionComponent* From = Planned.From.Get();
+		UFGCircuitConnectionComponent* To = Planned.To.Get();
+		if (!IsValid(From) || !IsValid(To) || From->GetNumFreeConnections() <= 0 || To->GetNumFreeConnections() <= 0)
+		{
+			Skipped++;
+			continue;
+		}
+		if (!bFree && !CanPay(Planned.Cost))
+		{
+			bShort = true;
+			break;
+		}
+		// Spawned, then connected: the order the game's own directly spawned wires use.
+		AFGBuildable* Owner = Cast<AFGBuildable>(From->GetOwner());
+		AFGBuildableBlueprintDesigner* Designer = Owner ? Owner->GetBlueprintDesigner() : nullptr;
+		const FTransform Transform(FRotator::ZeroRotator, (From->GetComponentLocation() + To->GetComponentLocation()) * 0.5);
+		AFGBuildable* Spawned = Buildables->BeginSpawnBuildable(WireClass, Transform);
+		AFGBuildableWire* Built = Cast<AFGBuildableWire>(Spawned);
+		if (!Built)
+		{
+			if (Spawned)
+			{
+				Spawned->Destroy();
+			}
+			Skipped++;
+			continue;
+		}
+		Built->SetBuiltWithRecipe(Recipe); // So it refunds like a hand-built wire
+		if (Designer)
+		{
+			Built->SetInsideBlueprintDesigner(Designer); // Must be set before BeginPlay
+		}
+		Built->FinishSpawning(Transform);
+		if (Designer)
+		{
+			Designer->OnBuildableConstructedInsideDesigner(Built);
+		}
+		if (!Built->Connect(From, To))
+		{
+			Built->Destroy();
+			Skipped++;
+			continue;
+		}
+		if (!PayBuildCost(Planned.Cost))
+		{
+			UE_LOG(LogFactoryAtlas, Warning, TEXT("Connect: built %s but couldn't take its whole cost"), *Built->GetName());
+		}
+		for (UFGCircuitConnectionComponent* End : { From, To })
+		{
+			if (AFGBuildablePowerPole* Pole = Cast<AFGBuildablePowerPole>(End->GetOwner()))
+			{
+				Pole->MarkConnectionsDirty();
+			}
+		}
+		BuiltCount++;
+		Metres += Planned.Metres;
+	}
+
+	UE_LOG(LogFactoryAtlas, Display, TEXT("Connect: %d power lines built (%.0f m), %d skipped, %d of %d groups left%s"),
+		BuiltCount, Metres, Skipped, Plan.GroupsAfter, Plan.GroupsBefore, bShort ? TEXT(", ran out of materials") : TEXT(""));
+	FString Text = FString::Printf(TEXT("Built %d power lines, %.0f m."), BuiltCount, Metres);
+	if (bShort)
+	{
+		Text += FString::Printf(TEXT(" Ran out of materials with %d to go."), Plan.Wires.Num() - BuiltCount - Skipped);
+	}
+	if (Skipped > 0)
+	{
+		Text += FString::Printf(TEXT(" %d couldn't be built."), Skipped);
+	}
+	if (Plan.GroupsAfter > 1)
+	{
+		Text += FString::Printf(TEXT(" %d groups were out of reach; a power pole between them helps."), Plan.GroupsAfter - 1);
+	}
+	ShowToast(FText::FromString(Text), BuiltCount == 0);
+	PlayClipboardSound(BuiltCount == 0 ? EClipboardSound::Error : EClipboardSound::Paste);
+
+	// The circuits catch up with the new wires on their own time, so the pick is done rather than planned again.
+	Dismantle.Targets.Reset();
+	Dismantle.bCapped = false;
+	RefreshDismantle();
+	bPortsDirty = true;
 }

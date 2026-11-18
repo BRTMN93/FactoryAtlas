@@ -30,6 +30,10 @@ namespace Atlas
 	constexpr double ZBaseCm = 20000.0;
 	constexpr double ZStepCm = 25.0;
 	constexpr int32 ZMaxValue = 16383;
+
+	// The height filter's ends. A filter reaching both shows every height, so new buildings out of range still show.
+	constexpr float HeightFilterMinMetres = -200.f;
+	constexpr float HeightFilterMaxMetres = 3895.f;
 	constexpr int32 HalfXMax = 2047;
 	constexpr int32 HalfYMax = 511;
 

@@ -799,6 +799,26 @@ namespace AtlasCustomize
 
 bool UAtlasSubsystem::ActOnHovered(TFunctionRef<void()> Action, TSet<const void*>* Done)
 {
+	return ActOnSelection([this]() { return SelectHovered(); }, Action, Done);
+}
+
+bool UAtlasSubsystem::ActOnActor(AFGBuildable* Actor, TFunctionRef<void()> Action)
+{
+	if (!IsValid(Actor))
+	{
+		return false;
+	}
+	return ActOnSelection([this, Actor]()
+	{
+		ClearSelection();
+		Selected = Actor;
+		RefreshCustomizeOptions();
+		return true;
+	}, Action, nullptr);
+}
+
+bool UAtlasSubsystem::ActOnSelection(TFunctionRef<bool()> Select, TFunctionRef<void()> Action, TSet<const void*>* Done)
+{
 	// Everything a selection carries, so it can come back exactly, without the panel rebuilding.
 	const bool bHadSelection = HasSelection();
 	const void* OldIdentity = GetSelectionIdentity();
@@ -824,7 +844,7 @@ bool UAtlasSubsystem::ActOnHovered(TFunctionRef<void()> Action, TSet<const void*
 		CustomizeError = OldError;
 	};
 
-	if (!SelectHovered())
+	if (!Select())
 	{
 		Restore();
 		return false;

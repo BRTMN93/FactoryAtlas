@@ -1,5 +1,6 @@
 #include "AtlasSubsystem.h"
 
+#include "Buildables/FGBuildableRamp.h"
 #include "FactoryAtlas.h"
 
 using namespace Atlas;
@@ -17,6 +18,12 @@ namespace AtlasMeasureDetail
 	constexpr float DragPixels = 4.f;
 	constexpr int32 MaxCopies = 16;
 	constexpr int32 MaxHits = 4096;
+
+	// Alt + wheel floors
+	constexpr float FloorRadiusMetres = 60.f;  // Foundations this close to the cursor count, so one factory's floors
+	constexpr float FloorMergeMetres = 2.f;    // Tops this close are one floor, such as 1 m and 2 m foundations side by side
+	constexpr float FloorBelowMetres = 2.5f;   // A floor's view starts this far under its top, so its own foundations show
+	constexpr int32 MinFloorPieces = 2;        // A lone foundation at its own height is a step, not a floor
 
 	FVector2f Rotate(const FVector2f& V, float Sin, float Cos)
 	{
@@ -158,6 +165,134 @@ bool UAtlasSubsystem::FindFoundationAt(const FVector2f& Metres, FVector4f& Out) 
 	return BestZ >= 0;
 }
 
+void UAtlasSubsystem::StepFloor(EView View, int32 Direction)
+{
+	const FGrid* Current = GetGrid();
+	if (!Current || Direction == 0)
+	{
+		return; // A worker owns the grid; the next notch tries again
+	}
+
+	// Foundation tops around the cursor, in whole metres, with how many pieces stand at each. Ramps are left out,
+	// since their box top is the high end of the slope. Hidden types still count: hiding foundations keeps floors.
+	TArray<int8> IsFlat;
+	IsFlat.Init(-1, Types.Num());
+	const FVector2f Cursor = CursorMetres(View);
+	TMap<int32, int32> Tops;
+	for (int32 CellY = CellCoord(Cursor.Y - FloorRadiusMetres); CellY <= CellCoord(Cursor.Y + FloorRadiusMetres); CellY++)
+	{
+		for (int32 CellX = CellCoord(Cursor.X - FloorRadiusMetres); CellX <= CellCoord(Cursor.X + FloorRadiusMetres); CellX++)
+		{
+			for (const FVector4f& Packed : Current->Cells[CellY * GridSize + CellX])
+			{
+				const FDecoded Record(Packed);
+				if (!Types.IsValidIndex(Record.Type) || Types[Record.Type].Category != ECategory::Foundations)
+				{
+					continue;
+				}
+				int8& Flat = IsFlat[Record.Type];
+				if (Flat < 0)
+				{
+					UClass* Class = Types[Record.Type].Class;
+					Flat = (Class && !Class->IsChildOf<AFGBuildableRamp>()) ? 1 : 0;
+				}
+				if (!Flat || FVector2f::DistSquared(RecordMetres(Record), Cursor) > FMath::Square(FloorRadiusMetres))
+				{
+					continue;
+				}
+				Tops.FindOrAdd(FMath::RoundToInt32(ZToMetres(Record.Z) + Types[Record.Type].HalfZCm / 100.f))++;
+			}
+		}
+	}
+
+	// Tops a metre or two apart are one floor, at the height most of its pieces share.
+	Tops.KeySort(TLess<int32>());
+	struct FFloor { int32 Top; int32 Best; int32 Pieces; };
+	TArray<FFloor> All;
+	for (const TPair<int32, int32>& Pair : Tops)
+	{
+		if (All.Num() > 0 && Pair.Key - All.Last().Top <= FloorMergeMetres)
+		{
+			FFloor& Floor = All.Last();
+			if (Pair.Value > Floor.Best)
+			{
+				Floor.Top = Pair.Key;
+				Floor.Best = Pair.Value;
+			}
+			Floor.Pieces += Pair.Value;
+			continue;
+		}
+		All.Add({ Pair.Key, Pair.Value, Pair.Value });
+	}
+	TArray<float> Floors;
+	for (const FFloor& Floor : All)
+	{
+		if (Floor.Pieces >= MinFloorPieces)
+		{
+			Floors.Add(float(Floor.Top));
+		}
+	}
+	if (Floors.IsEmpty())
+	{
+		for (const FFloor& Floor : All)
+		{
+			Floors.Add(float(Floor.Top));
+		}
+	}
+
+	const bool bOff = FilterLow <= HeightFilterMinMetres + 0.01f && FilterHigh >= HeightFilterMaxMetres - 0.01f;
+	const auto ShowAll = [this]()
+	{
+		SetHeightFilter(HeightFilterMinMetres, HeightFilterMaxMetres);
+		ShowToast(NSLOCTEXT("FactoryAtlas", "AllFloors", "All floors"));
+	};
+	if (Floors.IsEmpty())
+	{
+		if (bOff)
+		{
+			ShowToast(NSLOCTEXT("FactoryAtlas", "NoFloors", "No foundation floors here"), true);
+		}
+		else
+		{
+			ShowAll();
+		}
+		return;
+	}
+
+	// Each floor shows from just under its own top to just under the next one's foundations; the top floor shows
+	// everything above it.
+	const auto SliceLow = [&Floors](int32 Index) { return Floors[Index] - FloorBelowMetres; };
+	int32 Target = INDEX_NONE;
+	if (bOff)
+	{
+		Target = Direction > 0 ? 0 : Floors.Num() - 1;
+	}
+	else if (Direction > 0)
+	{
+		for (int32 i = 0; i < Floors.Num() && Target == INDEX_NONE; i++)
+		{
+			Target = SliceLow(i) > FilterLow + 0.5f ? i : INDEX_NONE;
+		}
+	}
+	else
+	{
+		for (int32 i = Floors.Num() - 1; i >= 0 && Target == INDEX_NONE; i--)
+		{
+			Target = SliceLow(i) < FilterLow - 0.5f ? i : INDEX_NONE;
+		}
+	}
+	if (Target == INDEX_NONE)
+	{
+		ShowAll();
+		return;
+	}
+
+	const float Low = SliceLow(Target);
+	const float High = Floors.IsValidIndex(Target + 1) ? FMath::Max(SliceLow(Target + 1) - 0.25f, Low + 0.5f) : HeightFilterMaxMetres;
+	SetHeightFilter(Low, High);
+	ShowToast(FText::FromString(FString::Printf(TEXT("Floor %d of %d  (%d m)"), Target + 1, Floors.Num(), FMath::RoundToInt32(Floors[Target]))));
+}
+
 void UAtlasSubsystem::SnapDraft(FMeasureView& State, const FVector2f& Metres) const
 {
 	FMeasureBox& Box = State.Draft;
@@ -178,6 +313,8 @@ void UAtlasSubsystem::SetMeasuring(EView View, bool bOn)
 	if (bOn)
 	{
 		SetWiring(View, false); // One mode at a time
+		SetPlacing(View, false);
+		SetDismantling(View, false);
 	}
 	if (!bOn)
 	{

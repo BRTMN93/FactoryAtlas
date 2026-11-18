@@ -8,6 +8,7 @@
 
 #include "AtlasMapHud.h"
 #include "AtlasMapPainter.h"
+#include "AtlasRealistic.h"
 #include "AtlasSubsystem.h"
 #include "AtlasTypes.h"
 #include "FactoryAtlas.h"
@@ -72,6 +73,7 @@ public:
 		{
 			Atlas->ClearHover(EView::Window);
 			Atlas->SetPointerOverPanel(false, EView::Window);
+			Atlas->OnMapClosed(EView::Window);
 		}
 	}
 
@@ -197,7 +199,7 @@ private:
 	void UpdateHover(UAtlasSubsystem& Atlas, FVector2f LocalOrigin, float PixelsPerMetre)
 	{
 		const FSettings& Settings = Atlas.GetSettings();
-		if (!Settings.bHoverLabel && !Settings.bHighlight && !Atlas.IsWiring(EView::Window))
+		if (!Settings.bHoverLabel && !Settings.bHighlight && !Atlas.IsWiring(EView::Window) && !Atlas.IsPlacing(EView::Window))
 		{
 			Atlas.ClearHover(EView::Window);
 			return;
@@ -268,8 +270,20 @@ private:
 		const float PixelsPerMetre = ScaleX / MapWidthMetres;
 
 		int32 Layer = LayerId + 1;
-		const bool bTerrain = TerrainResource.IsValid();
-		if (bTerrain)
+		// The realistic imagery needs nothing from the game's map, so with it on this window works before the
+		// in-game map has ever been opened. Until its first tiles are ready, the game's terrain stands in.
+		bool bRealistic = false;
+		if (Atlas->GetSettings().bRealisticTerrain)
+		{
+			const int32 Drawn = Realistic::Paint(Origin, Scale, CullingRect, OutDrawElements, Layer);
+			if (Drawn != INDEX_NONE)
+			{
+				Layer = Drawn;
+				bRealistic = true;
+			}
+		}
+		const bool bTerrain = bRealistic || TerrainResource.IsValid();
+		if (!bRealistic && bTerrain)
 		{
 			FSlateDrawElement::MakeBox(OutDrawElements, Layer, FPaintGeometry(Origin, Scale, 1.f), &TerrainBrush);
 		}
@@ -320,6 +334,13 @@ private:
 		if (!bTerrain)
 		{
 			PaintText(Geometry, OutDrawElements, ++Layer, FVector2f(12.f, 10.f), TEXT("Open the in-game map once to show the terrain here."));
+		}
+		if (bRealistic)
+		{
+			const FVector2f Corner(Geometry.LocalToAbsolute(FVector2D::ZeroVector));
+			const FVector2f Far(Geometry.LocalToAbsolute(FVector2D(Size)));
+			Realistic::PaintCredit(FSlateRect(Corner.X, Corner.Y, Far.X, Far.Y), Geometry.Scale, OutDrawElements, ++Layer);
+			++Layer;
 		}
 		return Layer;
 	}

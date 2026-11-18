@@ -1,6 +1,8 @@
 #include "AtlasSubsystem.h"
 #include "AtlasMapWindow.h"
 #include "AtlasModConfig.h"
+#include "AtlasPng.h"
+#include "AtlasRealistic.h"
 
 #include "Algo/Sort.h"
 #include "Async/ParallelFor.h"
@@ -20,6 +22,7 @@
 #include "Buildables/FGBuildableResourceExtractorBase.h"
 #include "Buildables/FGBuildableStair.h"
 #include "Buildables/FGBuildableStorage.h"
+#include "Buildables/FGBuildableTradingPost.h"
 #include "Buildables/FGBuildableTrainPlatform.h"
 #include "Buildables/FGBuildableWalkway.h"
 #include "Buildables/FGBuildableWall.h"
@@ -66,6 +69,9 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Layout/WidgetPath.h"
 #include "FGWorldScannableData.h"
+#include "FGDropPod.h"
+#include "FGItemPickup.h"
+#include "Engine/Level.h"
 #include "WheeledVehicles/FGVehiclePathNode.h"
 #include "WheeledVehicles/FGVehiclePathSegment.h"
 
@@ -181,6 +187,16 @@ namespace
 			return;
 		}
 
+		// For now: Road Maker (ficsit.app/mod/RoadMaker) draws its roads on the map itself, and ours on top of
+		// them look wrong. Leave everything from that mod out until the two can share the map.
+		const FString ClassPath = Class->GetPathName();
+		if (ClassPath.StartsWith(TEXT("/RoadMaker/")) || ClassPath.StartsWith(TEXT("/Script/RoadMaker.")))
+		{
+			Type.Kind = EKind::Skip;
+			Type.Category = ECategory::Paths;
+			return;
+		}
+
 		// Path nodes are only the joints; the segments between them are drawn as the path.
 		if (Class->IsChildOf<AFGVehiclePathNode>() || ClassName.Contains(TEXT("VehiclePathNode")))
 		{
@@ -249,6 +265,7 @@ namespace
 			{
 				const FVector Extent = Box.GetExtent();
 				Type.Center = Box.GetCenter();
+				Type.HalfZCm = float(Extent.Z);
 				Type.Half = FVector2f(FMath::Clamp(float(Extent.X), 10.f, 20000.f), FMath::Clamp(float(Extent.Y), 10.f, 5000.f));
 			}
 			else
@@ -494,6 +511,10 @@ void UAtlasSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	PaintColors.Add(FColor::Transparent); // Index 0 means unpainted
 	LoadSettings();
 	SyncModConfig();
+	if (UWorld* World = GetWorld())
+	{
+		ActorDestroyedHandle = World->AddOnActorDestroyedHandler(FOnActorDestroyed::FDelegate::CreateUObject(this, &UAtlasSubsystem::OnActorDestroyed));
+	}
 }
 
 void UAtlasSubsystem::Deinitialize()
@@ -503,14 +524,25 @@ void UAtlasSubsystem::Deinitialize()
 		Job.Wait();
 		bJobActive = false;
 	}
+	StopRenderExport(true);
 	CancelBeltDrag();
 	SetWiring(Wire.View, false);
+	SetPlacing(Place.View, false);
+	SetDismantling(Dismantle.View, false);
+	StopUpgradeTicker();
+	Upgrade = Atlas::FUpgradeTool();
 	ClearStatusLights();
 	BindBuildableDelegates(false);
+	if (UWorld* World = GetWorld(); World && ActorDestroyedHandle.IsValid())
+	{
+		World->RemoveOnActorDestroyedHandler(ActorDestroyedHandle);
+		ActorDestroyedHandle.Reset();
+	}
 	if (Active == this)
 	{
 		// Its GPU buffers hold this world's buildings.
 		Atlas::MapWindow::Close();
+		Atlas::Realistic::Release();
 		Active = nullptr;
 	}
 	Super::Deinitialize();
@@ -729,12 +761,15 @@ void UAtlasSubsystem::GatherCollectibles()
 		Count = 0;
 	}
 
-	// The object scanner keeps every pickup and drop pod in the world, loaded or not, in these reflected members.
-	AFGScannableSubsystem* Scannables = AFGScannableSubsystem::Get(GetWorld());
-	if (!Scannables)
+	CollectibleData = ECollectibleData::None;
+	UWorld* World = GetWorld();
+	if (!World)
 	{
 		return;
 	}
+	const bool bClient = World->GetNetMode() == NM_Client;
+
+	// The object scanner keeps every pickup and drop pod in the world, loaded or not, in these reflected members.
 	static const FArrayProperty* PickupsProperty = FindFProperty<FArrayProperty>(AFGScannableSubsystem::StaticClass(), TEXT("mAvailableItemPickups"));
 	static const FArrayProperty* PodsProperty = FindFProperty<FArrayProperty>(AFGScannableSubsystem::StaticClass(), TEXT("mAvailableDropPods"));
 	static const FSetProperty* DestroyedProperty = FindFProperty<FSetProperty>(AFGScannableSubsystem::StaticClass(), TEXT("mDestroyedPickups"));
@@ -745,10 +780,65 @@ void UAtlasSubsystem::GatherCollectibles()
 		return;
 	}
 
-	const TArray<FWorldScannableData>& Pickups = *PickupsProperty->ContainerPtrToValuePtr<TArray<FWorldScannableData>>(Scannables);
-	const TArray<FWorldScannableData>& Pods = *PodsProperty->ContainerPtrToValuePtr<TArray<FWorldScannableData>>(Scannables);
-	const TSet<FGuid>& Destroyed = *DestroyedProperty->ContainerPtrToValuePtr<TSet<FGuid>>(Scannables);
-	const TSet<FGuid>& Looted = *LootedProperty->ContainerPtrToValuePtr<TSet<FGuid>>(Scannables);
+	static const TArray<FWorldScannableData> NoData;
+	static const TSet<FGuid> NoGuids;
+	const TArray<FWorldScannableData>* PickupsPtr = &NoData;
+	const TArray<FWorldScannableData>* PodsPtr = &NoData;
+	const TSet<FGuid>* DestroyedPtr = &NoGuids;
+	const TSet<FGuid>* LootedPtr = &NoGuids;
+	const TCHAR* Source = TEXT("nothing");
+	if (AFGScannableSubsystem* Scannables = AFGScannableSubsystem::Get(World))
+	{
+		PickupsPtr = PickupsProperty->ContainerPtrToValuePtr<TArray<FWorldScannableData>>(Scannables);
+		PodsPtr = PodsProperty->ContainerPtrToValuePtr<TArray<FWorldScannableData>>(Scannables);
+		DestroyedPtr = DestroyedProperty->ContainerPtrToValuePtr<TSet<FGuid>>(Scannables);
+		LootedPtr = LootedProperty->ContainerPtrToValuePtr<TSet<FGuid>>(Scannables);
+		Source = TEXT("scannable subsystem");
+	}
+	// The lists reach the subsystem once, when the level's data generator begins play and finds it through the
+	// game state. On a client the game state's pointer to the subsystem is replicated and may not have arrived
+	// yet, and nothing retries, so the lists stay empty. The generator is part of the level, so read it directly.
+	if (PickupsPtr->IsEmpty() && PodsPtr->IsEmpty())
+	{
+		for (TActorIterator<AFGWorldScannableDataGenerator> It(World); It; ++It)
+		{
+			if (!It->mItemPickups.IsEmpty() || !It->mDropPods.IsEmpty())
+			{
+				PickupsPtr = &It->mItemPickups;
+				PodsPtr = &It->mDropPods;
+				Source = TEXT("world data generator");
+				break;
+			}
+		}
+	}
+	const TArray<FWorldScannableData>& Pickups = *PickupsPtr;
+	const TArray<FWorldScannableData>& Pods = *PodsPtr;
+	const TSet<FGuid>& Destroyed = *DestroyedPtr;
+	const TSet<FGuid>& Looted = *LootedPtr;
+	if (Pickups.IsEmpty() && Pods.IsEmpty())
+	{
+		static bool bLoggedMissing = false;
+		if (!bLoggedMissing)
+		{
+			bLoggedMissing = true;
+			UE_LOG(LogFactoryAtlas, Warning, TEXT("No collectible data in this world (client: %d), collectible counts are unavailable"), bClient ? 1 : 0);
+		}
+		return;
+	}
+	CollectibleData = bClient ? ECollectibleData::ClientPartial : ECollectibleData::Exact;
+
+	// The host's collected and looted sets are never written on a client. Drop pods replicate their own looted
+	// flag, so check the ones loaded here and remember them after they stream out.
+	if (bClient)
+	{
+		for (TActorIterator<AFGDropPod> It(World); It; ++It)
+		{
+			if (It->HasBeenLooted())
+			{
+				ClientLootedPods.Add(It->GetDropPodGuid());
+			}
+		}
+	}
 
 	const auto Add = [this](const FVector& Location, int32 Marker)
 	{
@@ -765,7 +855,7 @@ void UAtlasSubsystem::GatherCollectibles()
 	for (const FWorldScannableData& Pickup : Pickups)
 	{
 		UClass* Class = Pickup.ActorClass.Get();
-		if (!Class || Destroyed.Contains(Pickup.ActorGuid))
+		if (!Class || Destroyed.Contains(Pickup.ActorGuid) || ClientGonePickups.Contains(Pickup.ActorGuid))
 		{
 			continue;
 		}
@@ -791,7 +881,7 @@ void UAtlasSubsystem::GatherCollectibles()
 
 	for (const FWorldScannableData& Pod : Pods)
 	{
-		if (!Looted.Contains(Pod.ActorGuid))
+		if (!Looted.Contains(Pod.ActorGuid) && !ClientLootedPods.Contains(Pod.ActorGuid))
 		{
 			Add(Pod.ActorLocation, MarkerHardDrive);
 		}
@@ -799,8 +889,32 @@ void UAtlasSubsystem::GatherCollectibles()
 
 	if (bFirstTime)
 	{
-		UE_LOG(LogFactoryAtlas, Display, TEXT("Collectibles left: %d Somersloops, %d Mercer Spheres, %d hard drives, %d power slugs (%d pickups, %d drop pods in the world)"),
-			CollectibleCounts[0], CollectibleCounts[1], CollectibleCounts[2], CollectibleCounts[3], Pickups.Num(), Pods.Num());
+		UE_LOG(LogFactoryAtlas, Display, TEXT("Collectibles left: %d Somersloops, %d Mercer Spheres, %d hard drives, %d power slugs (%d pickups, %d drop pods in the world, from the %s, client: %d)"),
+			CollectibleCounts[0], CollectibleCounts[1], CollectibleCounts[2], CollectibleCounts[3], Pickups.Num(), Pods.Num(), Source, bClient ? 1 : 0);
+	}
+}
+
+void UAtlasSubsystem::OnActorDestroyed(AActor* Actor)
+{
+	// Only a client needs this; the host has the game's own record.
+	const AFGItemPickup* Pickup = Cast<AFGItemPickup>(Actor);
+	if (!Pickup || Pickup->HasAuthority())
+	{
+		return;
+	}
+	// Only a real destruction counts, not the area streaming out. Streaming out removes actors without
+	// destroying them, and the engine skips destroying startup actors when their level unloads
+	// (net.SkipDestroyNetStartupActorsOnChannelCloseDueToLevelUnloaded); this also covers the case where it doesn't.
+	const ULevel* Level = Pickup->GetLevel();
+	if (!Level || !Level->bIsVisible || Level->bIsBeingRemoved)
+	{
+		return;
+	}
+	const FGuid& Guid = Pickup->GetItemPickupGuid();
+	if (Guid.IsValid())
+	{
+		ClientGonePickups.Add(Guid);
+		LastMarkerSeconds = -1000.0; // Refresh on the next paint
 	}
 }
 
@@ -832,12 +946,49 @@ void UAtlasSubsystem::SyncModConfig()
 	{
 		return;
 	}
+	if (Config.bBasic)
+	{
+		// Only the effective values: the menu keeps its own, which come back when Basic map is turned off.
+		Config.bHoverLabel = false;
+		Config.bHoverHeight = false;
+		Config.bHoverCoordinates = false;
+		Config.bHighlight = false;
+		Config.bRecipeIcons = false;
+		Config.bStatusLights = false;
+		Config.bHideSpoilers = true;
+		Config.bBeltPorts = false;
+		Config.bPipePorts = false;
+		Config.bHypertubePorts = false;
+		Config.bRailPorts = false;
+	}
 	const bool bSpoilersChanged = Config.bHideSpoilers != Settings.bHideSpoilers;
+	const bool bBasicStarted = Config.bBasic && !Settings.bBasic;
 	Settings = Config;
 	if (bSpoilersChanged)
 	{
 		SetSpoilersHidden(Config.bHideSpoilers);
 	}
+	if (bBasicStarted)
+	{
+		LeaveMapTools();
+		ClearHover();
+	}
+}
+
+void UAtlasSubsystem::LeaveMapTools()
+{
+	CancelBeltDrag();
+	for (int32 i = 0; i < int32(Atlas::EView::Count); i++)
+	{
+		const Atlas::EView View = Atlas::EView(i);
+		if (IsMeasuring(View)) { SetMeasuring(View, false); }
+		if (IsWiring(View)) { SetWiring(View, false); }
+		if (IsPlacing(View)) { SetPlacing(View, false); }
+		if (IsDismantling(View)) { SetDismantling(View, false); }
+		if (IsChangingRecipes(View)) { SetChangingRecipes(View, false); }
+		if (IsConnecting(View)) { SetConnecting(View, false); }
+	}
+	ClearSelection();
 }
 
 namespace
@@ -997,7 +1148,7 @@ bool UAtlasSubsystem::SelectHovered()
 	const auto Accept = [this, Class]()
 	{
 		RefreshCustomizeOptions();
-		const bool bUseful = Class->IsChildOf<AFGBuildableFactory>() || !CustomizeOptions.Swatches.IsEmpty()
+		const bool bUseful = Class->IsChildOf<AFGBuildableFactory>() || Class->IsChildOf<AFGBuildableConveyorBase>() || !CustomizeOptions.Swatches.IsEmpty()
 			|| !CustomizeOptions.Patterns.IsEmpty() || !CustomizeOptions.Materials.IsEmpty() || GetControls().Any();
 		if (!bUseful)
 		{
@@ -1105,6 +1256,11 @@ void UAtlasSubsystem::ClearSelection()
 	CustomizeError = FText::GetEmpty();
 	ClipboardStatus = FText::GetEmpty();
 	SelectionVersion++;
+	// The upgrade trace belongs to the selection. A running upgrade finishes the line it started on.
+	if (Upgrade.bOpen)
+	{
+		SetUpgradeOpen(false);
+	}
 }
 
 bool UAtlasSubsystem::HasSelection() const
@@ -1177,10 +1333,10 @@ FFactoryState UAtlasSubsystem::GetSelectionState() const
 	return State;
 }
 
-TArray<FRecipeOption> UAtlasSubsystem::GetSelectedRecipeOptions() const
+/** The recipes a machine can run, as the game offers them at the machine, by name. Summaries at the given clock. */
+static TArray<FRecipeOption> MachineRecipeOptions(AFGBuildable* Building, float Potential)
 {
 	TArray<FRecipeOption> Options;
-	AFGBuildable* Building = Selected.Get();
 	UFunction* Function = Building ? Building->FindFunction(TEXT("GetAvailableRecipes")) : nullptr;
 	if (!Function)
 	{
@@ -1194,8 +1350,6 @@ TArray<FRecipeOption> UAtlasSubsystem::GetSelectedRecipeOptions() const
 	}
 	Building->ProcessEvent(Function, &Params);
 
-	float Potential = 1.f;
-	CallGetter(Building, TEXT("GetPendingPotential"), Potential);
 	for (const TSubclassOf<UFGRecipe>& Recipe : Params.Recipes)
 	{
 		if (Recipe)
@@ -1207,9 +1361,120 @@ TArray<FRecipeOption> UAtlasSubsystem::GetSelectedRecipeOptions() const
 	return Options;
 }
 
-bool UAtlasSubsystem::SetSelectedRecipe(UClass* Recipe)
+TArray<FRecipeOption> UAtlasSubsystem::GetSelectedRecipeOptions() const
 {
 	AFGBuildable* Building = Selected.Get();
+	float Potential = 1.f;
+	if (Building)
+	{
+		CallGetter(Building, TEXT("GetPendingPotential"), Potential);
+	}
+	return MachineRecipeOptions(Building, Potential);
+}
+
+void UAtlasSubsystem::GroupRecipes()
+{
+	Dismantle.RecipeGroups.Reset();
+	if (Dismantle.Purpose != EPickPurpose::Recipe)
+	{
+		return;
+	}
+	TMap<UClass*, int32> GroupOf;
+	for (const FDismantleTarget& Target : Dismantle.Targets)
+	{
+		AFGBuildable* Building = Target.Actor.Get();
+		if (!IsValid(Building) || !Building->IsA<AFGBuildableManufacturer>())
+		{
+			continue;
+		}
+		UClass* Class = Building->GetClass();
+		int32* Found = GroupOf.Find(Class);
+		if (!Found)
+		{
+			FRecipeGroup Group;
+			Group.Class = Class;
+			Group.Name = Types[TypeFor(Class)].Name;
+			// What a machine of this kind can run depends only on the kind and what is unlocked.
+			Group.Options = MachineRecipeOptions(Building, 1.f);
+			Found = &GroupOf.Add(Class, Dismantle.RecipeGroups.Add(MoveTemp(Group)));
+		}
+		FRecipeGroup& Group = Dismantle.RecipeGroups[*Found];
+		Group.Count++;
+		TSubclassOf<UFGRecipe> Recipe;
+		CallGetter(Building, TEXT("GetCurrentRecipe"), Recipe);
+		Group.Running.FindOrAdd(Recipe.Get())++;
+	}
+	Dismantle.RecipeGroups.Sort([](const FRecipeGroup& A, const FRecipeGroup& B)
+	{
+		return A.Count != B.Count ? A.Count > B.Count : A.Name.CompareTo(B.Name) < 0;
+	});
+}
+
+void UAtlasSubsystem::SetPickedRecipe(UClass* MachineClass, UClass* Recipe)
+{
+	if (!Dismantle.bMode || Dismantle.Purpose != EPickPurpose::Recipe || !MachineClass || !Recipe)
+	{
+		return;
+	}
+	if (!CanBuildBelts())
+	{
+		ShowToast(FText::FromString(TEXT("Recipes can only be changed from the map in single player or as the host.")), true);
+		PlayClipboardSound(EClipboardSound::Error);
+		return;
+	}
+	int32 Changed = 0;
+	int32 Already = 0;
+	int32 Failed = 0;
+	for (const FDismantleTarget& Target : Dismantle.Targets)
+	{
+		AFGBuildable* Building = Target.Actor.Get();
+		if (!IsValid(Building) || Building->GetClass() != MachineClass)
+		{
+			continue;
+		}
+		TSubclassOf<UFGRecipe> Current;
+		CallGetter(Building, TEXT("GetCurrentRecipe"), Current);
+		if (Current.Get() == Recipe)
+		{
+			Already++; // Left alone, so its items stay where they are
+			continue;
+		}
+		if (SetMachineRecipe(Building, Recipe))
+		{
+			Changed++;
+		}
+		else
+		{
+			Failed++;
+		}
+	}
+
+	const FText RecipeName = UFGRecipe::GetRecipeName(TSubclassOf<UFGRecipe>(Recipe));
+	const FText MachineName = Types[TypeFor(MachineClass)].Name;
+	UE_LOG(LogFactoryAtlas, Display, TEXT("Recipe pick: %d %s set to %s, %d already ran it, %d refused"),
+		Changed, *MachineName.ToString(), *Recipe->GetName(), Already, Failed);
+	FString Text = FString::Printf(TEXT("%d %s now make %s."), Changed, *MachineName.ToString(), *RecipeName.ToString());
+	if (Already > 0)
+	{
+		Text += FString::Printf(TEXT(" %d already did."), Already);
+	}
+	if (Failed > 0)
+	{
+		Text += FString::Printf(TEXT(" The game refused %d."), Failed);
+	}
+	ShowToast(FText::FromString(Text), Changed == 0 && Already == 0);
+	PlayClipboardSound(Changed == 0 && Already == 0 ? EClipboardSound::Error : EClipboardSound::Paste);
+	bPortsDirty = true; // A new recipe can change which ports a machine uses
+	RefreshDismantle();
+}
+
+bool UAtlasSubsystem::SetSelectedRecipe(UClass* Recipe)
+{
+	return SetMachineRecipe(Selected.Get(), Recipe);
+}
+
+bool UAtlasSubsystem::SetMachineRecipe(AFGBuildable* Building, UClass* Recipe)
+{
 	if (!Building || !Building->HasAuthority() || !Building->IsA<AFGBuildableManufacturer>() || !Recipe)
 	{
 		return false;
@@ -1252,7 +1517,7 @@ bool UAtlasSubsystem::SetSelectedRecipe(UClass* Recipe)
 
 	TSubclassOf<UFGRecipe> Now;
 	CallGetter(Building, TEXT("GetCurrentRecipe"), Now);
-	UE_LOG(LogFactoryAtlas, Display, TEXT("Recipe of %s set to %s, machine now reports %s"), *Building->GetName(), *Recipe->GetName(), *GetNameSafe(Now.Get()));
+	UE_LOG(LogFactoryAtlas, Verbose, TEXT("Recipe of %s set to %s, machine now reports %s"), *Building->GetName(), *Recipe->GetName(), *GetNameSafe(Now.Get()));
 	return Now.Get() == Recipe;
 }
 
@@ -1268,8 +1533,8 @@ void UAtlasSubsystem::SetSelectedClock(float Potential)
 	{
 		return;
 	}
-	// The game's own slider works in steps of 0.0001; match it so values look the same in its UI.
-	const float Clamped = FMath::RoundToFloat(FMath::Clamp(Potential, State.Min, State.Max) * 10000.f) / 10000.f;
+	// The game's own field takes four decimals of a percent (33.3333%); match it so presets like 1/3 stay exact there.
+	const float Clamped = FMath::RoundToFloat(FMath::Clamp(Potential, State.Min, State.Max) * 1000000.f) / 1000000.f;
 	CallSetter(Building, TEXT("SetPendingPotential"), Clamped);
 }
 
@@ -1637,6 +1902,24 @@ void UAtlasSubsystem::OnMapOpened()
 	}
 }
 
+void UAtlasSubsystem::OnMapClosed(EView View)
+{
+	// Whatever was in flight on this map is let go now. The click handlers go with the map, so a release that comes
+	// after this is never seen, and a held port, wire or hologram would otherwise be waiting under the cursor when
+	// the map is opened again.
+	if ((BeltDrag.bPressed || BeltDrag.bActive) && BeltDrag.View == View)
+	{
+		CancelBeltDrag();
+	}
+	SetWiring(View, false);
+	SetPlacing(View, false);
+	if (Dismantle.bMode && Dismantle.View == View)
+	{
+		CancelDismantleBox();
+	}
+	CancelMeasureDrag(View);
+}
+
 void UAtlasSubsystem::EnsureScanned()
 {
 	const int32 Stress = FMath::Max(0, CVarStress.GetValueOnGameThread());
@@ -1676,7 +1959,7 @@ void UAtlasSubsystem::Scan()
 	int64 Actors = 0;
 	for (AFGBuildable* Buildable : Buildables->GetAllBuildablesRef())
 	{
-		if (!Buildable || Buildable->GetIsLightweightTemporary() || Buildable->ManagedByLightweightBuildableSubsystem())
+		if (!IsMappedActor(Buildable))
 		{
 			continue;
 		}
@@ -1817,9 +2100,25 @@ bool UAtlasSubsystem::RecordOf(AFGBuildable* Buildable, FVector4f& Out)
 	return bFound;
 }
 
+bool UAtlasSubsystem::IsMappedActor(const AFGBuildable* Buildable)
+{
+	if (!IsValid(Buildable) || Buildable->GetIsLightweightTemporary() || Buildable->ManagedByLightweightBuildableSubsystem())
+	{
+		return false;
+	}
+	// The HUB spawns its storage box, locker, work bench, terminal, potty and burners as buildables of
+	// their own. The player cannot build them, and the HUB already covers them on the map.
+	if (Buildable->GetClass()->ImplementsInterface(UFGTradingPostIntegratedBuildable::StaticClass()))
+	{
+		return false;
+	}
+	const AActor* Parent = Buildable->GetParentBuildableActor();
+	return !(Parent && Parent->IsA<AFGBuildableTradingPost>());
+}
+
 void UAtlasSubsystem::QueueActor(AFGBuildable* Buildable, bool bAdded)
 {
-	if (!bScanned || !Buildable || Buildable->GetIsLightweightTemporary() || Buildable->ManagedByLightweightBuildableSubsystem())
+	if (!bScanned || !IsMappedActor(Buildable))
 	{
 		return;
 	}
@@ -2253,13 +2552,15 @@ void UAtlasSubsystem::UpdateHover(FVector2f Uv, float PixelsPerMetre, EView View
 void UAtlasSubsystem::StartExport()
 {
 	const FGrid* Current = GetGrid();
-	if (!Current || (ExportState && ExportState->Stage.load() == 1))
+	if (!Current || IsExporting())
 	{
 		return;
 	}
-
-	// The PNG encoder must be loaded on the game thread before a worker can use it.
-	FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	if (Settings.bExportRendered)
+	{
+		StartRenderExport();
+		return;
+	}
 
 	FlushPalette();
 	TSharedPtr<FGrid> Snapshot = MakeShared<FGrid>();
@@ -2271,62 +2572,80 @@ void UAtlasSubsystem::StartExport()
 	TSharedPtr<FExportState> State = MakeShared<FExportState>();
 	State->Stage.store(1);
 	State->Path = FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir() / FString::Printf(TEXT("Atlas_%s.png"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+	State->Rows = Settings.ExportSize;
 	ExportState = State;
 
 	UE::Tasks::Launch(UE_SOURCE_LOCATION,
 		[Snapshot, State, Colors = PaletteData, bPaint = bPaintMode, Size = Settings.ExportSize, ZLow = MetresToZ(FilterLow), ZHigh = MetresToZ(FilterHigh)]()
 		{
 			const double PixelsPerMetre = double(Size) / MapWidthMetres;
+
+			// The image goes out in bands, so a 32768 px export needs 128 MB rather than 4 GB.
+			const int32 Band = FMath::Min(Size, 1024);
 			TArray64<FColor> Image;
-			Image.Init(FColor::Transparent, int64(Size) * Size);
+			Image.SetNumUninitialized(int64(Size) * Band);
+			FPngStreamWriter Png;
+			bool bSaved = Png.Open(State->Path, Size, Size);
 
-			for (const TArray<FVector4f>& Cell : Snapshot->Cells)
+			for (int32 Top = 0; bSaved && Top < Size; Top += Band)
 			{
-				for (const FVector4f& Packed : Cell)
+				const int32 Rows = FMath::Min(Band, Size - Top);
+				const int32 Bottom = Top + Rows - 1;
+				FMemory::Memzero(Image.GetData(), int64(Size) * Rows * sizeof(FColor));
+
+				for (const TArray<FVector4f>& Cell : Snapshot->Cells)
 				{
-					const FDecoded Record(Packed);
-					FColor Color = Colors[Record.Type];
-					if (Color.A == 0 || Record.Z < ZLow || Record.Z > ZHigh)
+					for (const FVector4f& Packed : Cell)
 					{
-						continue;
-					}
-					if (bPaint && Record.Paint > 0)
-					{
-						Color = Colors[MaxTypes + Record.Paint];
-					}
-					Color.A = 255; // The palette's alpha is a flag, not transparency.
-
-					const float CenterX = float(Record.X) / PositionMax * Size;
-					const float CenterY = float(Record.Y) / PositionMax * Size;
-					const float HalfX = FMath::Max(float(Record.HalfX * 0.1 * PixelsPerMetre), 0.5f);
-					const float HalfY = FMath::Max(float(Record.HalfY * 0.1 * PixelsPerMetre), 0.5f);
-					float Sin, Cos;
-					FMath::SinCos(&Sin, &Cos, Record.Angle / 1024.f * UE_TWO_PI);
-					const float ExtentX = FMath::Abs(HalfX * Cos) + FMath::Abs(HalfY * Sin);
-					const float ExtentY = FMath::Abs(HalfX * Sin) + FMath::Abs(HalfY * Cos);
-
-					const int32 MinX = FMath::Max(0, FMath::FloorToInt32(CenterX - ExtentX));
-					const int32 MaxX = FMath::Min(Size - 1, FMath::CeilToInt32(CenterX + ExtentX));
-					const int32 MinY = FMath::Max(0, FMath::FloorToInt32(CenterY - ExtentY));
-					const int32 MaxY = FMath::Min(Size - 1, FMath::CeilToInt32(CenterY + ExtentY));
-					for (int32 Y = MinY; Y <= MaxY; Y++)
-					{
-						for (int32 X = MinX; X <= MaxX; X++)
+						const FDecoded Record(Packed);
+						FColor Color = Colors[Record.Type];
+						if (Color.A == 0 || Record.Z < ZLow || Record.Z > ZHigh)
 						{
-							const float DX = X + 0.5f - CenterX;
-							const float DY = Y + 0.5f - CenterY;
-							if (FMath::Abs(DX * Cos + DY * Sin) <= HalfX && FMath::Abs(-DX * Sin + DY * Cos) <= HalfY)
+							continue;
+						}
+						if (bPaint && Record.Paint > 0)
+						{
+							Color = Colors[MaxTypes + Record.Paint];
+						}
+						Color.A = 255; // The palette's alpha is a flag, not transparency.
+
+						const float CenterX = float(Record.X) / PositionMax * Size;
+						const float CenterY = float(Record.Y) / PositionMax * Size;
+						const float HalfX = FMath::Max(float(Record.HalfX * 0.1 * PixelsPerMetre), 0.5f);
+						const float HalfY = FMath::Max(float(Record.HalfY * 0.1 * PixelsPerMetre), 0.5f);
+						float Sin, Cos;
+						FMath::SinCos(&Sin, &Cos, Record.Angle / 1024.f * UE_TWO_PI);
+						const float ExtentX = FMath::Abs(HalfX * Cos) + FMath::Abs(HalfY * Sin);
+						const float ExtentY = FMath::Abs(HalfX * Sin) + FMath::Abs(HalfY * Cos);
+
+						const int32 MinY = FMath::Max(Top, FMath::FloorToInt32(CenterY - ExtentY));
+						const int32 MaxY = FMath::Min(Bottom, FMath::CeilToInt32(CenterY + ExtentY));
+						if (MinY > MaxY)
+						{
+							continue;
+						}
+						const int32 MinX = FMath::Max(0, FMath::FloorToInt32(CenterX - ExtentX));
+						const int32 MaxX = FMath::Min(Size - 1, FMath::CeilToInt32(CenterX + ExtentX));
+						for (int32 Y = MinY; Y <= MaxY; Y++)
+						{
+							for (int32 X = MinX; X <= MaxX; X++)
 							{
-								Image[int64(Y) * Size + X] = Color;
+								const float DX = X + 0.5f - CenterX;
+								const float DY = Y + 0.5f - CenterY;
+								if (FMath::Abs(DX * Cos + DY * Sin) <= HalfX && FMath::Abs(-DX * Sin + DY * Cos) <= HalfY)
+								{
+									Image[int64(Y - Top) * Size + X] = Color;
+								}
 							}
 						}
 					}
 				}
+
+				bSaved = Png.WriteRows(Image.GetData(), Rows);
+				State->RowsDone.store(Top + Rows);
 			}
 
-			TArray64<uint8> Compressed;
-			FImageUtils::PNGCompressImageArray(Size, Size, TArrayView64<const FColor>(Image.GetData(), Image.Num()), Compressed);
-			const bool bSaved = Compressed.Num() > 0 && FFileHelper::SaveArrayToFile(Compressed, *State->Path);
+			bSaved = Png.Close() && bSaved;
 			UE_LOG(LogFactoryAtlas, Display, TEXT("Export %s: %s"), bSaved ? TEXT("saved") : TEXT("failed"), *State->Path);
 			State->Stage.store(bSaved ? 2 : 3);
 		});
@@ -2341,6 +2660,16 @@ FText UAtlasSubsystem::GetExportStatus() const
 	switch (ExportState->Stage.load())
 	{
 	case 1:
+		if (ExportState->bRendered && ExportState->TilesDone.load() < ExportState->TilesTotal.load())
+		{
+			return FText::FromString(FString::Printf(TEXT("Rendering tile %d of %d..."),
+				ExportState->TilesDone.load() + 1, ExportState->TilesTotal.load()));
+		}
+		if (ExportState->Rows > 0)
+		{
+			return FText::FromString(FString::Printf(TEXT("Writing the image... %d%%"),
+				FMath::Clamp(int32(int64(ExportState->RowsDone.load()) * 100 / ExportState->Rows), 0, 99)));
+		}
 		return FText::FromString(TEXT("Exporting..."));
 	case 2:
 		return FText::FromString(FString::Printf(TEXT("Saved to %s"), *FPaths::GetCleanFilename(ExportState->Path)));
@@ -2361,8 +2690,10 @@ void UAtlasSubsystem::SaveSettings() const
 	Lines.Add(FString::Printf(TEXT("appearance=%d"), bAppearanceOpen ? 1 : 0));
 	Lines.Add(FString::Printf(TEXT("opacity=%.2f"), Settings.Opacity));
 	Lines.Add(FString::Printf(TEXT("exportSize=%d"), Settings.ExportSize));
+	Lines.Add(FString::Printf(TEXT("exportRendered=%d"), Settings.bExportRendered ? 1 : 0));
 	Lines.Add(FString::Printf(TEXT("radiation=%d"), Settings.bRadiation ? 1 : 0));
 	Lines.Add(FString::Printf(TEXT("zoom=%d"), Settings.ZoomFactor));
+	Lines.Add(FString::Printf(TEXT("realistic=%d"), Settings.bRealisticTerrain ? 1 : 0));
 	Lines.Add(FString::Printf(TEXT("beltTier=%d"), Settings.BeltTierFromTop));
 	Lines.Add(FString::Printf(TEXT("pipeTier=%d"), Settings.PipeTierFromTop));
 	Lines.Add(FString::Printf(TEXT("collectibles=%u"), CollectibleMask));
@@ -2417,12 +2748,18 @@ void UAtlasSubsystem::LoadSettings()
 		else if (Key == TEXT("fullscreen")) { bFullscreen = Value == TEXT("1"); }
 		else if (Key == TEXT("appearance")) { bAppearanceOpen = Value == TEXT("1"); }
 		else if (Key == TEXT("opacity")) { Settings.Opacity = FMath::Clamp(FCString::Atof(*Value), 0.2f, 1.f); }
-		else if (Key == TEXT("exportSize")) { Settings.ExportSize = FCString::Atoi(*Value) == 4096 ? 4096 : 8192; }
+		else if (Key == TEXT("exportSize"))
+		{
+			const int32 Size = FCString::Atoi(*Value);
+			Settings.ExportSize = Size == 4096 || Size == 32768 ? Size : 8192;
+		}
+		else if (Key == TEXT("exportRendered")) { Settings.bExportRendered = Value == TEXT("1"); }
 		else if (Key == TEXT("radiation")) { Settings.bRadiation = Value == TEXT("1"); }
 		else if (Key == TEXT("collectibles")) { CollectibleMask = uint32(FCString::Atoi(*Value)) & ((1u << int32(ECollectible::Count)) - 1); }
 		else if (Key == TEXT("features")) { FeatureMask = uint32(FCString::Atoi(*Value)) & ((1u << int32(EFeature::Count)) - 1); }
 		else if (Key == TEXT("hiddenResource")) { HiddenResourcePaths.Add(Value); }
 		else if (Key == TEXT("zoom")) { Settings.ZoomFactor = FMath::Clamp(FCString::Atoi(*Value), 1, 8); }
+		else if (Key == TEXT("realistic")) { Settings.bRealisticTerrain = Value == TEXT("1"); }
 		else if (Key == TEXT("beltTier")) { Settings.BeltTierFromTop = FMath::Clamp(FCString::Atoi(*Value), 0, 16); }
 		else if (Key == TEXT("pipeTier")) { Settings.PipeTierFromTop = FMath::Clamp(FCString::Atoi(*Value), 0, 16); }
 		else if (Key == TEXT("hiddenType")) { HiddenTypePaths.Add(Value); }
@@ -2460,4 +2797,183 @@ void UAtlasSubsystem::LoadSettings()
 			}
 		}
 	}
+}
+
+bool UAtlasSubsystem::FindHoveredTarget(FDismantleTarget& Out)
+{
+	if (!Hover.bValid || Hover.bMarker || !Types.IsValidIndex(Hover.Type))
+	{
+		return false;
+	}
+	UClass* Class = Types[Hover.Type].Class;
+	if (!Class || !Class->IsChildOf<AFGBuildable>())
+	{
+		return false;
+	}
+	const FType& Type = Types[Hover.Type];
+	auto Collect = [&Out](const FVector4f& Record) { Out.Records.Add(Record); };
+	Out = FDismantleTarget();
+	Out.Class = Class;
+	if (GetDefault<AFGBuildable>(Class)->ManagedByLightweightBuildableSubsystem())
+	{
+		AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(GetWorld());
+		const TArray<FRuntimeBuildableInstanceData>* Instances = Lightweights ? Lightweights->GetAllLightweightBuildableInstances().Find(Class) : nullptr;
+		for (int32 Index = 0; Instances && Index < Instances->Num(); Index++)
+		{
+			const FRuntimeBuildableInstanceData& Data = (*Instances)[Index];
+			if (!Data.IsValid())
+			{
+				continue;
+			}
+			bool bMatch = false;
+			auto Sink = [this, &bMatch](const FVector4f& Record) { bMatch |= SameBuilding(Record, Hover.Source); };
+			EmitLightweight(Data, Type, Hover.Type, 0, Sink);
+			if (bMatch)
+			{
+				Out.bLightweight = true;
+				Out.Index = Index;
+				Out.Lightweight.Initialize(Lightweights, Class, Index);
+				EmitLightweight(Data, Type, Hover.Type, 0, Collect);
+				return true;
+			}
+		}
+		return false;
+	}
+	AFGBuildable* Building = FindHoveredActor();
+	if (!Building)
+	{
+		return false;
+	}
+	Out.Actor = Building;
+	EmitActor(Building, Type, Hover.Type, 0, Collect);
+	return true;
+}
+
+void UAtlasSubsystem::CollectTargetsInBox(const FVector2f& Min, const FVector2f& Max, TArray<FDismantleTarget>& Out, int32 Limit, bool& bOutCapped,
+	EPickPurpose Purpose)
+{
+	bOutCapped = false;
+	AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(GetWorld());
+	AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(GetWorld());
+	if (!Buildables || !Lightweights)
+	{
+		return;
+	}
+	// A building counts when the middle of any of its shapes is in the box and the map is showing it.
+	const auto Inside = [this, &Min, &Max](const FVector4f& Record)
+	{
+		const FDecoded Decoded(Record);
+		if (!IsRecordShown(Decoded))
+		{
+			return false;
+		}
+		const float X = float(Decoded.X) / float(PositionMax) * MapWidthMetres;
+		const float Y = float(Decoded.Y) / float(PositionMax) * MapWidthMetres;
+		return X >= Min.X && X <= Max.X && Y >= Min.Y && Y <= Max.Y;
+	};
+	TArray<FVector4f> Records;
+	auto Collect = [&Records](const FVector4f& Record) { Records.Add(Record); };
+	const auto Take = [&](FDismantleTarget&& Target)
+	{
+		if (!Records.ContainsByPredicate(Inside))
+		{
+			return true;
+		}
+		if (Purpose == EPickPurpose::Power && !IsWirable(Target.Actor.Get()))
+		{
+			return true;
+		}
+		if (Out.Num() >= Limit)
+		{
+			bOutCapped = true;
+			return false;
+		}
+		Target.Records = Records;
+		Out.Add(MoveTemp(Target));
+		return true;
+	};
+
+	for (AFGBuildable* Building : Buildables->GetAllBuildablesRef())
+	{
+		if (!IsMappedActor(Building) || (Purpose == EPickPurpose::Recipe && !Building->IsA<AFGBuildableManufacturer>()))
+		{
+			continue;
+		}
+		const int32 TypeId = TypeFor(Building->GetClass());
+		Records.Reset();
+		EmitActor(Building, Types[TypeId], TypeId, 0, Collect);
+		FDismantleTarget Target;
+		Target.Actor = Building;
+		Target.Class = Building->GetClass();
+		if (!Take(MoveTemp(Target)))
+		{
+			return;
+		}
+	}
+	if (Purpose != EPickPurpose::Dismantle)
+	{
+		return; // Foundations and walls run no recipes
+	}
+	for (const auto& Pair : Lightweights->GetAllLightweightBuildableInstances())
+	{
+		UClass* Class = Pair.Key.Get();
+		if (!Class)
+		{
+			continue;
+		}
+		const int32 TypeId = TypeFor(Class);
+		for (int32 Index = 0; Index < Pair.Value.Num(); Index++)
+		{
+			const FRuntimeBuildableInstanceData& Data = Pair.Value[Index];
+			if (!Data.IsValid())
+			{
+				continue;
+			}
+			Records.Reset();
+			EmitLightweight(Data, Types[TypeId], TypeId, 0, Collect);
+			FDismantleTarget Target;
+			Target.bLightweight = true;
+			Target.Class = Class;
+			Target.Index = Index;
+			Target.Lightweight.Initialize(Lightweights, Class, Index);
+			if (!Take(MoveTemp(Target)))
+			{
+				return;
+			}
+		}
+	}
+}
+
+bool UAtlasSubsystem::TargetForActor(AFGBuildable* Building, FDismantleTarget& Out)
+{
+	if (!IsValid(Building) || Building->GetIsLightweightTemporary())
+	{
+		return false;
+	}
+	Out = FDismantleTarget();
+	Out.Actor = Building;
+	Out.Class = Building->GetClass();
+	const int32 TypeId = TypeFor(Out.Class);
+	auto Collect = [&Out](const FVector4f& Record) { Out.Records.Add(Record); };
+	EmitActor(Building, Types[TypeId], TypeId, 0, Collect);
+	return true;
+}
+
+bool UAtlasSubsystem::TargetForInstance(UClass* Class, int32 Index, FDismantleTarget& Out)
+{
+	AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(GetWorld());
+	const TArray<FRuntimeBuildableInstanceData>* Instances = Lightweights && Class ? Lightweights->GetAllLightweightBuildableInstances().Find(Class) : nullptr;
+	if (!Instances || !Instances->IsValidIndex(Index) || !(*Instances)[Index].IsValid())
+	{
+		return false;
+	}
+	Out = FDismantleTarget();
+	Out.bLightweight = true;
+	Out.Class = Class;
+	Out.Index = Index;
+	Out.Lightweight.Initialize(Lightweights, Class, Index);
+	const int32 TypeId = TypeFor(Class);
+	auto Collect = [&Out](const FVector4f& Record) { Out.Records.Add(Record); };
+	EmitLightweight((*Instances)[Index], Types[TypeId], TypeId, 0, Collect);
+	return true;
 }

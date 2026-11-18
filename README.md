@@ -16,7 +16,7 @@ For Satisfactory 1.2 with [SML](https://ficsit.app/mod/SML) 3.12. Mod reference:
 - Category colors, your own colors, or the buildings' real paint
 - Collectibles, resource nodes, wells, spore flowers, gas pillars and radioactivity, or a spoiler-free map without them
 - Status lights when zoomed in: green producing, purple overclocked, yellow standby, red error
-- Up to 8x zoom, fullscreen, a second window for another monitor, and PNG export
+- Up to 8x zoom, fullscreen, a second window for another monitor, and PNG export up to 32K, flat or rendered
 
 **Working from the map**
 - Hover a building for its name, height and coordinates

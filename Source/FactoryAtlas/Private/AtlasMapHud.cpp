@@ -1,6 +1,7 @@
 #include "AtlasMapHud.h"
 
 #include "AtlasMapWindow.h"
+#include "AtlasRealistic.h"
 #include "AtlasSubsystem.h"
 #include "FactoryAtlas.h"
 #include "Blueprint/WidgetTree.h"
@@ -55,8 +56,8 @@ namespace
 	const FLinearColor RowColor(FColor(38, 38, 40));
 	const FLinearColor TextMain(FColor(240, 240, 240));
 	const FLinearColor TextDim(FColor(168, 168, 170));
-	constexpr float MinHeightMetres = -200.f;
-	constexpr float MaxHeightMetres = 3895.f;
+	constexpr float MinHeightMetres = Atlas::HeightFilterMinMetres;
+	constexpr float MaxHeightMetres = Atlas::HeightFilterMaxMetres;
 
 	/** Built only from solid brushes, because Slate's stock images are not in the cooked game. */
 	struct FAtlasStyle
@@ -176,6 +177,7 @@ namespace
 			{ TEXT("Build Belt, Pipe or Track"), TEXT("Drag LMB from Port") },
 			{ TEXT("Close Settings"), TEXT("LMB Empty Map") },
 			{ TEXT("Zoom"), TEXT("Scroll") },
+			{ TEXT("Floors"), TEXT("Alt + Scroll") },
 		};
 		if (View == EView::Window)
 		{
@@ -343,6 +345,14 @@ namespace
 
 		float GetLow() const { return Low; }
 		float GetHigh() const { return High; }
+
+		/** Moves the handles without calling OnChanged, to follow a filter set some other way. */
+		void SetRange(float InLow, float InHigh)
+		{
+			Low = FMath::Clamp(FMath::Min(InLow, InHigh), 0.f, 1.f);
+			High = FMath::Clamp(FMath::Max(InLow, InHigh), 0.f, 1.f);
+			Invalidate(EInvalidateWidgetReason::Paint);
+		}
 
 		virtual FVector2D ComputeDesiredSize(float) const override
 		{
@@ -705,7 +715,8 @@ public:
 			.Padding(TAttribute<FMargin>::CreateLambda([this]() { return FMargin(0.f, 0.f, 0.f, View == EView::Game ? HintInset + 106.f : 12.f); }))
 			[
 				SNew(SHorizontalBox)
-				.Visibility(EVisibility::SelfHitTestInvisible)
+				// Basic map has no tools and takes no clicks, so neither the tool tiles nor the key hints show.
+				.Visibility_Lambda([]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsBasic() ? EVisibility::Collapsed : EVisibility::SelfHitTestInvisible; })
 				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(2.f, 0.f))
 				[
 					SAssignNew(MeasureTile, SBox)[MakeMeasureTile()]
@@ -721,10 +732,50 @@ public:
 							[this]() { if (UAtlasSubsystem* Atlas = Sub()) { Atlas->SetWiring(View, !Atlas->IsWiring(View)); } })
 					]
 				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(2.f, 0.f))
+				[
+					SAssignNew(PlaceTile, SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->CanBuildBelts() ? EVisibility::Visible : EVisibility::Collapsed; })
+					[
+						MakeModeTile(TEXT("Place"), TEXT("Alt + Q"),
+							[this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsPlacing(View); },
+							[this]() { TogglePlacing(); })
+					]
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(2.f, 0.f))
+				[
+					SAssignNew(DismantleTile, SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->CanBuildBelts() ? EVisibility::Visible : EVisibility::Collapsed; })
+					[
+						MakeModeTile(TEXT("Dismantle"), TEXT("Alt + F"),
+							[this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsDismantling(View); },
+							[this]() { if (UAtlasSubsystem* Atlas = Sub()) { Atlas->SetDismantling(View, !Atlas->IsDismantling(View)); } })
+					]
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(2.f, 0.f))
+				[
+					SAssignNew(RecipeTile, SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->CanBuildBelts() ? EVisibility::Visible : EVisibility::Collapsed; })
+					[
+						MakeModeTile(TEXT("Recipes"), TEXT("Alt + R"),
+							[this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsChangingRecipes(View); },
+							[this]() { if (UAtlasSubsystem* Atlas = Sub()) { Atlas->SetChangingRecipes(View, !Atlas->IsChangingRecipes(View)); } })
+					]
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(2.f, 0.f))
+				[
+					SAssignNew(ConnectTile, SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->CanBuildBelts() ? EVisibility::Visible : EVisibility::Collapsed; })
+					[
+						MakeModeTile(TEXT("Connect"), TEXT("Alt + C"),
+							[this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsConnecting(View); },
+							[this]() { if (UAtlasSubsystem* Atlas = Sub()) { Atlas->SetConnecting(View, !Atlas->IsConnecting(View)); } })
+					]
+				]
 				+ SHorizontalBox::Slot().AutoWidth()
 				[
 					SNew(SBox)
-					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && (Atlas->IsMeasuring(View) || Atlas->IsWiring(View)) ? EVisibility::Collapsed : EVisibility::HitTestInvisible; })
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && (Atlas->IsMeasuring(View) || Atlas->IsWiring(View) || Atlas->IsPlacing(View) || Atlas->IsPicking(View)) ? EVisibility::Collapsed : EVisibility::HitTestInvisible; })
 					[
 						MakeShortcutBar(View)
 					]
@@ -757,6 +808,87 @@ public:
 						})
 					]
 				]
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsPlacing(View) ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+					[
+						MakeKeyHints({
+							{ TEXT("Build"), TEXT("LMB") },
+							{ TEXT("Build Row"), TEXT("Drag LMB") },
+							{ TEXT("Manifold"), TEXT("Ctrl + Drag LMB") },
+							{ TEXT("Rotate"), TEXT("R / Shift + R") },
+							{ TEXT("Take Machine"), TEXT("MMB") },
+							{ TEXT("Pick Building"), TEXT("Q") },
+							{ TEXT("Pan"), TEXT("Space + Drag LMB") },
+							{ TEXT("Put Down"), TEXT("RMB") },
+							{ TEXT("Stop Placing"), TEXT("Esc / Alt + Q") },
+						})
+					]
+				]
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsDismantling(View) ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+					[
+						MakeKeyHints({
+							{ TEXT("Pick"), TEXT("LMB") },
+							{ TEXT("Pick Box"), TEXT("Drag LMB") },
+							{ TEXT("Unpick Box"), TEXT("Shift + Drag LMB") },
+							{ TEXT("Pan"), TEXT("Space + Drag LMB") },
+							{ TEXT("Dismantle"), TEXT("Enter") },
+							{ TEXT("Clear"), TEXT("RMB") },
+							{ TEXT("Stop"), TEXT("Esc / Alt + F") },
+						})
+					]
+				]
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsChangingRecipes(View) ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+					[
+						MakeKeyHints({
+							{ TEXT("Pick Machine"), TEXT("LMB") },
+							{ TEXT("Pick Box"), TEXT("Drag LMB") },
+							{ TEXT("Unpick Box"), TEXT("Shift + Drag LMB") },
+							{ TEXT("Pan"), TEXT("Space + Drag LMB") },
+							{ TEXT("Clear"), TEXT("RMB") },
+							{ TEXT("Stop"), TEXT("Esc / Alt + R") },
+						})
+					]
+				]
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SBox)
+					.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return Atlas && Atlas->IsConnecting(View) ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+					[
+						MakeKeyHints({
+							{ TEXT("Pick"), TEXT("LMB") },
+							{ TEXT("Pick Box"), TEXT("Drag LMB") },
+							{ TEXT("Unpick Box"), TEXT("Shift + Drag LMB") },
+							{ TEXT("Pan"), TEXT("Space + Drag LMB") },
+							{ TEXT("Connect"), TEXT("Enter") },
+							{ TEXT("Clear"), TEXT("RMB") },
+							{ TEXT("Stop"), TEXT("Esc / Alt + C") },
+						})
+					]
+				]
+			]
+			// Above the shortcut bar while picking a building to place; see MakePlacePicker.
+			+ SOverlay::Slot()
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Bottom)
+			.Padding(TAttribute<FMargin>::CreateLambda([this]() { return FMargin(0.f, 0.f, 0.f, (View == EView::Game ? HintInset + 106.f : 12.f) + 70.f); }))
+			[
+				MakePlacePicker()
+			]
+			// The same spot in recipe mode, once machines are picked; see MakeRecipePanel.
+			+ SOverlay::Slot()
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Bottom)
+			.Padding(TAttribute<FMargin>::CreateLambda([this]() { return FMargin(0.f, 0.f, 0.f, (View == EView::Game ? HintInset + 106.f : 12.f) + 70.f); }))
+			[
+				MakeRecipePanel()
 			]
 			// Placed over the selected building each frame; see PlaceSelectionPanel.
 			+ SOverlay::Slot()
@@ -838,7 +970,17 @@ public:
 			const FName Type = Focused->GetType();
 			if (Type == FName(TEXT("SEditableText")) || Type == FName(TEXT("SMultiLineEditableText")))
 			{
-				return false;
+				if (Event.GetKey() == EKeys::Escape && bPlacePicker && Focused == PlaceSearchBox)
+				{
+					SetPlacePicker(false);
+					return true;
+				}
+				// The search box keeps the keyboard only while the picker shows.
+				if (Focused != PlaceSearchBox || bPlacePicker)
+				{
+					return false;
+				}
+				FSlateApplication::Get().ClearKeyboardFocus(EFocusCause::SetDirectly);
 			}
 		}
 		const FKey Key = Event.GetKey();
@@ -858,6 +1000,97 @@ public:
 				Atlas->SetWiring(View, false);
 			}
 			return true;
+		}
+		// Alt+F toggles dismantle mode, after the game's F. In it, Enter dismantles what is picked and Esc unpicks it,
+		// then leaves.
+		if (Key == EKeys::F && Event.IsAltDown() && !Event.IsControlDown() && !Event.IsShiftDown())
+		{
+			if (!Event.IsRepeat())
+			{
+				Atlas->SetDismantling(View, !Atlas->IsDismantling(View));
+			}
+			return true;
+		}
+		// Alt+R toggles recipe mode: pick machines as in dismantle mode, then choose a recipe for each kind in the list.
+		if (Key == EKeys::R && Event.IsAltDown() && !Event.IsControlDown() && !Event.IsShiftDown())
+		{
+			if (!Event.IsRepeat())
+			{
+				Atlas->SetChangingRecipes(View, !Atlas->IsChangingRecipes(View));
+			}
+			return true;
+		}
+		// Alt+C toggles connect mode: pick buildings, and Enter wires them all onto one power circuit.
+		if (Key == EKeys::C && Event.IsAltDown() && !Event.IsControlDown() && !Event.IsShiftDown())
+		{
+			if (!Event.IsRepeat())
+			{
+				Atlas->SetConnecting(View, !Atlas->IsConnecting(View));
+			}
+			return true;
+		}
+		if (Atlas->IsPicking(View))
+		{
+			if ((Key == EKeys::Enter || Key == EKeys::Virtual_Accept) && !Event.IsRepeat() && Atlas->IsDismantling(View))
+			{
+				Atlas->DismantlePicked();
+				return true;
+			}
+			if ((Key == EKeys::Enter || Key == EKeys::Virtual_Accept) && !Event.IsRepeat() && Atlas->IsConnecting(View))
+			{
+				Atlas->ConnectPicked();
+				return true;
+			}
+			if (Key == EKeys::Escape)
+			{
+				if (Atlas->GetDismantle().bPressed)
+				{
+					Atlas->CancelDismantleBox();
+				}
+				else if (!Atlas->ClearDismantle())
+				{
+					Atlas->SetDismantling(View, false);
+				}
+				return true;
+			}
+		}
+		// Alt+Q toggles place mode, after the game's Q build menu. In it, Q picks a building, R turns it and Esc
+		// closes the picker, then puts down what is in hand, then leaves place mode.
+		if (Key == EKeys::Q && Event.IsAltDown() && !Event.IsControlDown() && !Event.IsShiftDown())
+		{
+			if (!Event.IsRepeat())
+			{
+				TogglePlacing();
+			}
+			return true;
+		}
+		if (Atlas->IsPlacing(View))
+		{
+			if (Key == EKeys::Q && !Event.GetModifierKeys().AnyModifiersDown())
+			{
+				if (!Event.IsRepeat())
+				{
+					SetPlacePicker(!bPlacePicker);
+				}
+				return true;
+			}
+			if (Key == EKeys::R && !Event.IsAltDown())
+			{
+				Atlas->RotatePlace(Event.IsShiftDown() ? -1 : 1, Event.IsControlDown());
+				return true;
+			}
+			if (Key == EKeys::Escape)
+			{
+				if (bPlacePicker)
+				{
+					SetPlacePicker(false);
+				}
+				else if (!Atlas->DropPlace())
+				{
+					Atlas->SetPlacing(View, false);
+				}
+				return true;
+			}
 		}
 		if (Key == EKeys::G && !Event.GetModifierKeys().AnyModifiersDown())
 		{
@@ -1203,6 +1436,18 @@ public:
 			Atlas->ClickWire(View);
 			return;
 		}
+		// In dismantle and recipe mode picking happens on press and release; a click doesn't open the building's panel.
+		if (Atlas->IsPicking(View))
+		{
+			return;
+		}
+		// In place mode a click builds what is in hand.
+		if (Atlas->IsPlacing(View))
+		{
+			SetPlacePicker(false);
+			Atlas->ClickPlace(View);
+			return;
+		}
 		const bool bSelected = Atlas->SelectHovered();
 		if (View == EView::Window)
 		{
@@ -1303,18 +1548,381 @@ public:
 	bool OnMapPortPress(const FVector2f& ScreenPosition)
 	{
 		UAtlasSubsystem* Atlas = Sub();
-		return Atlas && !Atlas->IsWiring(View) && Atlas->PressBeltPort(View, ScreenPosition);
+		return Atlas && !Atlas->IsWiring(View) && !Atlas->IsPlacing(View) && !Atlas->IsPicking(View) && Atlas->PressBeltPort(View, ScreenPosition);
 	}
 
-	/** A right press over this map in wire mode: true when it let go of a running wire. */
+	/** A right press over this map in wire or place mode: true when it let go of a running wire or the building in hand. */
 	bool OnMapWireDrop(const FVector2f& ScreenPosition)
 	{
 		UAtlasSubsystem* Atlas = Sub();
-		if (!Atlas || !Atlas->IsWiring(View) || Atlas->IsPointerOverPanel(View) || !Atlas->IsPointOnMap(ScreenPosition, View))
+		if (!Atlas || (!Atlas->IsWiring(View) && !Atlas->IsPlacing(View) && !Atlas->IsPicking(View)) || Atlas->IsPointerOverPanel(View)
+			|| !Atlas->IsPointOnMap(ScreenPosition, View))
 		{
 			return false;
 		}
-		return Atlas->DropWire();
+		if (Atlas->IsPicking(View))
+		{
+			return Atlas->ClearDismantle();
+		}
+		return Atlas->IsPlacing(View) ? Atlas->DropPlace() : Atlas->DropWire();
+	}
+
+	/** A middle press over this map: true when it took the building under the cursor in hand to place copies of. */
+	bool OnMapSample(const FVector2f& ScreenPosition)
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		if (!Atlas || !Atlas->CanBuildBelts() || Atlas->IsPointerOverPanel(View) || !Atlas->IsPointOnMap(ScreenPosition, View))
+		{
+			return false;
+		}
+		if (!Atlas->SampleHovered(View))
+		{
+			return false;
+		}
+		SetPlacePicker(false);
+		return true;
+	}
+
+	/** The Place tile and Alt+Q: on with the picker open when nothing is in hand yet, or off. */
+	void TogglePlacing()
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		if (!Atlas)
+		{
+			return;
+		}
+		if (Atlas->IsPlacing(View))
+		{
+			Atlas->SetPlacing(View, false);
+			SetPlacePicker(false);
+			return;
+		}
+		Atlas->SetPlacing(View, true);
+		// A blueprint chosen in the build gun comes along; otherwise the picker opens.
+		if (Atlas->IsPlacing(View) && !Atlas->GetPlace().Recipe)
+		{
+			Atlas->TakeBuildGunBlueprint(View);
+		}
+		SetPlacePicker(Atlas->IsPlacing(View) && !Atlas->GetPlace().Recipe);
+	}
+
+	/** Opening the picker puts the cursor in its search box, so typing a name and Enter picks a building. */
+	void SetPlacePicker(bool bOpen)
+	{
+		bPlacePicker = bOpen;
+		if (bOpen)
+		{
+			PlaceSearch.Reset();
+			if (PlaceSearchBox.IsValid())
+			{
+				PlaceSearchBox->SetText(FText::GetEmpty());
+			}
+			FillPlaceList();
+			// The box is only shown from the next frame, so focus is given from Tick.
+			SearchFocusFrames = 5;
+		}
+		else
+		{
+			SearchFocusFrames = 0;
+			if (PlaceSearchBox.IsValid() && PlaceSearchBox->HasKeyboardFocus())
+			{
+				FSlateApplication::Get().ClearKeyboardFocus(EFocusCause::SetDirectly);
+			}
+		}
+	}
+
+	/** Enter in the search box: the first building the list shows. */
+	void PickFirstPlaceOption()
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		if (Atlas && FirstPlaceRecipe)
+		{
+			Atlas->SetPlaceRecipe(View, FirstPlaceRecipe);
+		}
+		SetPlacePicker(false);
+	}
+
+	/** A left press on the map in dismantle mode: true when it is one, which picks on release. */
+	bool OnMapDismantlePress(const FVector2f& ScreenPosition, bool bRemove)
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		if (!Atlas || !Atlas->IsPicking(View) || Atlas->IsPointerOverPanel(View) || !Atlas->IsPointOnMap(ScreenPosition, View))
+		{
+			return false;
+		}
+		return Atlas->PressDismantle(View, bRemove);
+	}
+
+	/** A left press on the map with a building in hand: true when this processor should own it, for a row drag. */
+	bool OnMapPlacePress(const FVector2f& ScreenPosition)
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		if (!Atlas || !Atlas->IsPlacing(View) || Atlas->IsPointerOverPanel(View) || !Atlas->IsPointOnMap(ScreenPosition, View))
+		{
+			return false;
+		}
+		SetPlacePicker(false);
+		return Atlas->PressPlaceRow(View);
+	}
+
+	void OnMapPlaceMove()
+	{
+		if (UAtlasSubsystem* Atlas = Sub())
+		{
+			Atlas->MovePlaceRow(View);
+		}
+	}
+
+	/** True when the press was a row, now being built; false for an ordinary click. */
+	bool OnMapPlaceRelease()
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		return Atlas && Atlas->ReleasePlaceRow(View);
+	}
+
+	void OnMapPlaceCancel()
+	{
+		if (UAtlasSubsystem* Atlas = Sub())
+		{
+			if (!Atlas->GetPlace().bRowBuilding)
+			{
+				Atlas->CancelPlaceRow();
+			}
+		}
+	}
+
+	/** The buildings that can be placed, grouped, with a search box. Picking one puts it in hand. */
+	/** Recipe mode with machines picked: the recipes each picked kind of machine can run, above the hint bar. */
+	bool HasRecipePanel() const
+	{
+		const UAtlasSubsystem* Atlas = Sub();
+		return Atlas && Atlas->IsChangingRecipes(View) && !Atlas->GetDismantle().RecipeGroups.IsEmpty();
+	}
+
+	TSharedRef<SWidget> MakeRecipePanel()
+	{
+		const FAtlasStyle& Style = FAtlasStyle::Get();
+		return SAssignNew(RecipePanel, SAtlasPanelBorder)
+			.BorderImage(&Style.Body)
+			.Padding(FMargin(8.f, 6.f))
+			.Visibility_Lambda([this]() { return HasRecipePanel() ? EVisibility::Visible : EVisibility::Collapsed; })
+			[
+				SNew(SBox)
+				.WidthOverride(340.f)
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						MakeLabel(TEXT("Change the recipe of every picked machine"), Style.FontBold, TextMain)
+					]
+					+ SVerticalBox::Slot().AutoHeight().MaxHeight(360.f)
+					[
+						SNew(SScrollBox)
+						.Style(&Style.Scroll)
+						.ScrollBarStyle(&Style.ScrollBar)
+						+ SScrollBox::Slot()
+						[
+							SAssignNew(RecipeGroupList, SVerticalBox)
+						]
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 6.f, 0.f, 0.f))
+					[
+						SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+						.Text(FText::FromString(TEXT("Items inside each machine that changes go to your inventory, as when you change it at the machine. Rates are at 100% clock.")))
+					]
+				]
+			];
+	}
+
+	void FillRecipePanel()
+	{
+		const UAtlasSubsystem* Atlas = Sub();
+		if (!RecipeGroupList || !Atlas)
+		{
+			return;
+		}
+		const FAtlasStyle& Style = FAtlasStyle::Get();
+		RecipeGroupList->ClearChildren();
+		const TArray<FRecipeGroup>& Groups = Atlas->GetDismantle().RecipeGroups;
+		for (int32 GroupIndex = 0; GroupIndex < Groups.Num(); GroupIndex++)
+		{
+			const FRecipeGroup& Group = Groups[GroupIndex];
+			RecipeGroupList->AddSlot().AutoHeight().Padding(FMargin(6.f, GroupIndex > 0 ? 8.f : 2.f, 6.f, 2.f))
+			[
+				MakeLabel(FText::FromString(FString::Printf(TEXT("%d  %s"), Group.Count, *Group.Name.ToString())), Style.FontSmall, TextDim)
+			];
+			if (Group.Options.IsEmpty())
+			{
+				RecipeGroupList->AddSlot().AutoHeight().Padding(FMargin(6.f, 2.f))[MakeLabel(TEXT("No recipes available"), Style.FontSmall, TextDim)];
+			}
+			UClass* MachineClass = Group.Class;
+			for (const FRecipeOption& Option : Group.Options)
+			{
+				UClass* Recipe = Option.Recipe;
+				const int32 Running = Group.Running.FindRef(Recipe);
+				const bool bAll = Running == Group.Count;
+				const FString Note = Running == 0 ? FString() : bAll ? FString(TEXT("all")) : FString::Printf(TEXT("%d run it"), Running);
+				RecipeGroupList->AddSlot().AutoHeight()
+				[
+					SNew(SAtlasButton)
+					.ButtonStyle(&Style.Flat)
+					.IsFocusable(false)
+					.ContentPadding(FMargin(6.f, 3.f))
+					.ToolTip(MakeTip(FText::FromString(bAll
+						? FString::Printf(TEXT("Every picked %s already runs this."), *Group.Name.ToString())
+						: FString::Printf(TEXT("Switch %d %s to this recipe."), Group.Count - Running, *Group.Name.ToString()))))
+					.OnClicked_Lambda([MachineClass, Recipe]()
+					{
+						if (UAtlasSubsystem* Picked = Sub())
+						{
+							Picked->SetPickedRecipe(MachineClass, Recipe);
+						}
+						return FReply::Handled();
+					})
+					[
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot().AutoHeight()
+						[
+							SNew(SHorizontalBox)
+							+ SHorizontalBox::Slot().FillWidth(1.f)
+							[
+								MakeLabel(Option.Name, Style.Font, bAll ? Accent : TextMain)
+							]
+							+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(8.f, 0.f, 0.f, 0.f))
+							[
+								MakeLabel(FText::FromString(Note), Style.FontSmall, bAll ? Accent : TextDim)
+							]
+						]
+						+ SVerticalBox::Slot().AutoHeight()
+						[
+							SNew(STextBlock).Text(FText::FromString(Option.Summary)).Font(Style.FontSmall)
+							.ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+						]
+					]
+				];
+			}
+		}
+	}
+
+	TSharedRef<SWidget> MakePlacePicker()
+	{
+		const FAtlasStyle& Style = FAtlasStyle::Get();
+		return SAssignNew(PlacePicker, SAtlasPanelBorder)
+			.BorderImage(&Style.Body)
+			.Padding(FMargin(8.f, 6.f))
+			.Visibility_Lambda([this]() { const UAtlasSubsystem* Atlas = Sub(); return bPlacePicker && Atlas && Atlas->IsPlacing(View) ? EVisibility::Visible : EVisibility::Collapsed; })
+			[
+				SNew(SBox)
+				.WidthOverride(300.f)
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						MakeLabel(TEXT("Place a building"), Style.FontBold, TextMain)
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SBorder)
+						.BorderImage(&Style.White)
+						.BorderBackgroundColor(FSlateColor(RowColor))
+						.Padding(FMargin(6.f, 3.f))
+						[
+							SAssignNew(PlaceSearchBox, SEditableText)
+							.Style(&Style.TextInput)
+							.HintText(FText::FromString(TEXT("Search, Enter picks the first")))
+							.ClearKeyboardFocusOnCommit(true)
+							.OnTextCommitted_Lambda([this](const FText&, ETextCommit::Type Commit)
+							{
+								if (Commit == ETextCommit::OnEnter)
+								{
+									PickFirstPlaceOption();
+								}
+							})
+							.OnTextChanged_Lambda([this](const FText& Text)
+							{
+								PlaceSearch = Text.ToString();
+								FillPlaceList();
+							})
+						]
+					]
+					+ SVerticalBox::Slot().AutoHeight().MaxHeight(360.f)
+					[
+						SNew(SScrollBox)
+						.Style(&Style.Scroll)
+						.ScrollBarStyle(&Style.ScrollBar)
+						+ SScrollBox::Slot()
+						[
+							SAssignNew(PlaceList, SVerticalBox)
+						]
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 6.f, 0.f, 0.f))
+					[
+						SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+						.Text(FText::FromString(TEXT("Or middle click a machine on the map to place copies of it with its settings.")))
+					]
+				]
+			];
+	}
+
+	void FillPlaceList()
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		if (!PlaceList || !Atlas)
+		{
+			return;
+		}
+		const FAtlasStyle& Style = FAtlasStyle::Get();
+		PlaceList->ClearChildren();
+		const FString Search = PlaceSearch.TrimStartAndEnd();
+		const TCHAR* LastGroup = nullptr;
+		int32 Shown = 0;
+		FirstPlaceRecipe = nullptr;
+		for (const FPlaceOption& Option : Atlas->GetPlaceOptions())
+		{
+			if (!Search.IsEmpty() && !Option.Name.ToString().Contains(Search))
+			{
+				continue;
+			}
+			if (Option.Group != LastGroup)
+			{
+				LastGroup = Option.Group;
+				PlaceList->AddSlot().AutoHeight().Padding(FMargin(6.f, Shown > 0 ? 8.f : 2.f, 6.f, 2.f))[MakeLabel(Option.Group, Style.FontSmall, TextDim)];
+			}
+			UClass* Recipe = Option.Recipe;
+			if (!FirstPlaceRecipe)
+			{
+				FirstPlaceRecipe = Recipe;
+			}
+			const bool bCurrent = Atlas->GetPlace().Recipe == Recipe;
+			PlaceList->AddSlot().AutoHeight()
+			[
+				SNew(SAtlasButton)
+				.ButtonStyle(&Style.Flat)
+				.IsFocusable(false)
+				.ContentPadding(FMargin(6.f, 3.f))
+				.OnClicked_Lambda([this, Recipe]()
+				{
+					if (UAtlasSubsystem* Picked = Sub())
+					{
+						Picked->SetPlaceRecipe(View, Recipe);
+					}
+					// Through SetPlacePicker, so the search box gives up the keyboard and R, Q and Esc work again.
+					SetPlacePicker(false);
+					return FReply::Handled();
+				})
+				[
+					MakeLabel(Option.Name, Style.Font, bCurrent ? Accent : TextMain)
+				]
+			];
+			Shown++;
+		}
+		if (Shown == 0)
+		{
+			PlaceList->AddSlot().AutoHeight().Padding(FMargin(6.f, 4.f))
+			[
+				MakeLabel(Search.IsEmpty() ? TEXT("Nothing unlocked to place yet") : TEXT("No building by that name"), Style.FontSmall, TextDim)
+			];
+		}
 	}
 
 	void EndDragPaste()
@@ -1348,8 +1956,29 @@ public:
 			|| (SelectionPanel.IsValid() && Atlas->HasSelection() && SelectionPanel->GetTickSpaceGeometry().IsUnderLocation(Cursor))
 			|| (MeasurePanel.IsValid() && HasMeasurePanel() && MeasurePanel->GetTickSpaceGeometry().IsUnderLocation(Cursor))
 			|| (MeasureTile.IsValid() && MeasureTile->GetTickSpaceGeometry().IsUnderLocation(Cursor))
-			|| (WireTile.IsValid() && Atlas->CanBuildBelts() && WireTile->GetTickSpaceGeometry().IsUnderLocation(Cursor));
+			|| (WireTile.IsValid() && Atlas->CanBuildBelts() && WireTile->GetTickSpaceGeometry().IsUnderLocation(Cursor))
+			|| (PlaceTile.IsValid() && Atlas->CanBuildBelts() && PlaceTile->GetTickSpaceGeometry().IsUnderLocation(Cursor))
+			|| (DismantleTile.IsValid() && Atlas->CanBuildBelts() && DismantleTile->GetTickSpaceGeometry().IsUnderLocation(Cursor))
+			|| (RecipeTile.IsValid() && Atlas->CanBuildBelts() && RecipeTile->GetTickSpaceGeometry().IsUnderLocation(Cursor))
+			|| (ConnectTile.IsValid() && Atlas->CanBuildBelts() && ConnectTile->GetTickSpaceGeometry().IsUnderLocation(Cursor))
+			|| (RecipePanel.IsValid() && HasRecipePanel() && RecipePanel->GetTickSpaceGeometry().IsUnderLocation(Cursor))
+			|| (PlacePicker.IsValid() && bPlacePicker && Atlas->IsPlacing(View) && PlacePicker->GetTickSpaceGeometry().IsUnderLocation(Cursor));
 		Atlas->SetPointerOverPanel(bOverPanel, View);
+		SyncHeightSlider(*Atlas);
+		if (BuiltRecipeGroupsVersion != Atlas->GetRecipeGroupsVersion())
+		{
+			BuiltRecipeGroupsVersion = Atlas->GetRecipeGroupsVersion();
+			FillRecipePanel();
+		}
+		if (bPlacePicker && !Atlas->IsPlacing(View))
+		{
+			SetPlacePicker(false);
+		}
+		if (SearchFocusFrames > 0 && bPlacePicker && PlaceSearchBox.IsValid())
+		{
+			FSlateApplication::Get().SetKeyboardFocus(PlaceSearchBox, EFocusCause::SetDirectly);
+			SearchFocusFrames = PlaceSearchBox->HasKeyboardFocus() ? 0 : SearchFocusFrames - 1;
+		}
 
 		// The map can reach past the bottom of the screen (the game's window frame keeps some of its height),
 		// so the hint bar is lifted by however much of this widget is below the viewport.
@@ -1377,6 +2006,12 @@ public:
 		{
 			BuiltSelectionVersion = Atlas->GetSelectionVersion();
 			RebuildCustomizeLists(*Atlas);
+			bRemeasure = true;
+		}
+		if (BuiltUpgradeVersion != Atlas->GetUpgradeVersion())
+		{
+			BuiltUpgradeVersion = Atlas->GetUpgradeVersion();
+			RebuildUpgradeList();
 			bRemeasure = true;
 		}
 		SyncDraft(*Atlas);
@@ -1415,7 +2050,9 @@ public:
 		const int32 MeasureLayer = PaintMeasure(AllottedGeometry, OutDrawElements, LayerId);
 		const int32 Layer = SCompoundWidget::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, MeasureLayer, InWidgetStyle, bParentEnabled);
 		const int32 LabelLayer = PaintHoverLabel(AllottedGeometry, OutDrawElements, Layer);
-		const int32 WireLayer = PaintWireLabel(AllottedGeometry, OutDrawElements, LabelLayer);
+		const int32 DismantleLayer = PaintDismantleLabel(AllottedGeometry, OutDrawElements, LabelLayer);
+		const int32 PlaceLayer = PaintPlaceLabel(AllottedGeometry, OutDrawElements, DismantleLayer);
+		const int32 WireLayer = PaintWireLabel(AllottedGeometry, OutDrawElements, PlaceLayer);
 		const int32 DragLayer = PaintDragLabel(AllottedGeometry, OutDrawElements, WireLayer);
 		return PaintToast(AllottedGeometry, OutDrawElements, DragLayer);
 	}
@@ -1429,7 +2066,6 @@ public:
 			return Layer;
 		}
 		const FWireTool& Wire = Atlas->GetWire();
-		const FAtlasStyle& Style = FAtlasStyle::Get();
 		const FLinearColor Bad(FColor(235, 90, 80));
 		const bool bHovered = Atlas->GetHover().bValid && Atlas->GetHoverView() == View && !Atlas->GetHoverName().IsEmpty();
 		const FString WireName = Wire.WireName.IsEmpty() ? FString(TEXT("Power Line")) : Wire.WireName.ToString();
@@ -1469,6 +2105,15 @@ public:
 			Lines.Add({ FString(TEXT("RMB  drop wire     Esc  stop")), TextDim });
 		}
 
+		const FLinearColor Band = Wire.bHasStart && Wire.bReady && !Wire.bValid && !Wire.Reason.IsEmpty() ? Bad : Accent;
+		return PaintCursorCard(AllottedGeometry, OutDrawElements, Layer, Title, Lines, Band);
+	}
+
+	/** A card by the cursor: a title band in Band's color, then lines of text, kept on screen. */
+	int32 PaintCursorCard(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements, int32 Layer, const FString& Title,
+		const TArray<TPair<FString, FLinearColor>>& Lines, const FLinearColor& Band) const
+	{
+		const FAtlasStyle& Style = FAtlasStyle::Get();
 		const TSharedRef<FSlateFontMeasure> Measure = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
 		const FVector2f Padding(9.f, 4.f);
 		const FVector2f TitleSize(Measure->Measure(Title, Style.FontBold));
@@ -1488,7 +2133,6 @@ public:
 		Position.X = FMath::Min(Position.X, LocalSize.X - BoxSize.X - 4.f);
 		Position.Y = FMath::Min(Position.Y, LocalSize.Y - BoxSize.Y - 4.f);
 
-		const FLinearColor Band = Wire.bHasStart && Wire.bReady && !Wire.bValid && !Wire.Reason.IsEmpty() ? Bad : Accent;
 		FSlateDrawElement::MakeBox(OutDrawElements, Layer + 1, AllottedGeometry.ToPaintGeometry(BoxSize, FSlateLayoutTransform(Position)),
 			&Style.White, ESlateDrawEffect::None, BodyColor);
 		FSlateDrawElement::MakeBox(OutDrawElements, Layer + 2, AllottedGeometry.ToPaintGeometry(FVector2f(BoxSize.X, TitleBand), FSlateLayoutTransform(Position)),
@@ -1503,6 +2147,199 @@ public:
 			LinePosition.Y += LineHeight;
 		}
 		return Layer + 3;
+	}
+
+	/** In dismantle mode, by the cursor: what is under it, how much is picked and what dismantling it gives back. */
+	int32 PaintDismantleLabel(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements, int32 Layer) const
+	{
+		const UAtlasSubsystem* Atlas = Sub();
+		if (!Atlas || !Atlas->IsPicking(View) || !GetTickSpaceGeometry().IsUnderLocation(FSlateApplication::Get().GetCursorPos())
+			|| Atlas->IsPointerOverPanel(View))
+		{
+			return Layer;
+		}
+		const FDismantleTool& Tool = Atlas->GetDismantle();
+		const bool bRecipe = Atlas->IsChangingRecipes(View);
+		const bool bHovered = Atlas->GetHover().bValid && !Atlas->GetHover().bMarker && Atlas->GetHoverView() == View && !Atlas->GetHoverName().IsEmpty();
+		const bool bPower = Atlas->IsConnecting(View);
+		const FString Title = bHovered && !Tool.bBoxing ? Atlas->GetHoverName().ToString()
+			: FString(bRecipe ? TEXT("Change Recipes") : bPower ? TEXT("Connect Power") : TEXT("Dismantle"));
+		TArray<TPair<FString, FLinearColor>> Lines;
+		if (bPower)
+		{
+			const FPowerPlan& Plan = Tool.Power;
+			const FLinearColor Bad(FColor(235, 90, 80));
+			bool bBad = false;
+			if (Tool.Shown().IsEmpty())
+			{
+				Lines.Add({ FString(Tool.bBoxing ? TEXT("Nothing with a power connection in the box") : TEXT("Click buildings or drag a box to pick them")), TextDim });
+			}
+			else if (Tool.bPreview)
+			{
+				Lines.Add({ FString::Printf(TEXT("%d picked%s"), Tool.Shown().Num(), Tool.ShownCapped() ? TEXT(" (the most one pick holds)") : TEXT("")), TextMain });
+				Lines.Add({ FString(TEXT("Let go to plan the wiring")), TextDim });
+			}
+			else
+			{
+				Lines.Add({ FString::Printf(TEXT("%d picked, on %d power circuit%s now"), Plan.Buildings, Plan.GroupsBefore, Plan.GroupsBefore == 1 ? TEXT("") : TEXT("s")), TextMain });
+				if (Plan.Wires.IsEmpty())
+				{
+					Lines.Add({ FString(Plan.GroupsBefore <= 1 ? TEXT("Already all connected") : !Plan.ShortText.IsEmpty() ? *Plan.ShortText
+						: TEXT("Nothing can be joined: too far apart or no free connections")), Plan.GroupsBefore <= 1 ? TextDim : Bad });
+					bBad = Plan.GroupsBefore > 1;
+				}
+				else
+				{
+					Lines.Add({ FString::Printf(TEXT("Builds %d power line%s, %.0f m"), Plan.Wires.Num(), Plan.Wires.Num() == 1 ? TEXT("") : TEXT("s"), Plan.Metres), TextMain });
+					if (!Plan.CostText.IsEmpty())
+					{
+						Lines.Add({ FString::Printf(TEXT("Costs %s"), *Plan.CostText), TextDim });
+					}
+					if (!Plan.ShortText.IsEmpty())
+					{
+						Lines.Add({ Plan.ShortText, Bad });
+					}
+				}
+				if (Plan.GroupsAfter > 1)
+				{
+					Lines.Add({ FString::Printf(TEXT("%d group%s out of reach, in red: a power pole between them helps"), Plan.GroupsAfter - 1, Plan.GroupsAfter == 2 ? TEXT("") : TEXT("s")), Bad });
+				}
+				Lines.Add({ FString(TEXT("Enter  connect     RMB  clear     Esc  stop")), TextDim });
+			}
+			return PaintCursorCard(AllottedGeometry, OutDrawElements, Layer, Title, Lines, bBad ? Bad : FLinearColor(FColor(230, 175, 40)));
+		}
+		if (bRecipe)
+		{
+			if (Tool.Shown().IsEmpty())
+			{
+				Lines.Add({ FString(Tool.bBoxing ? TEXT("No machines in the box") : TEXT("Click machines or drag a box to pick them")), TextDim });
+			}
+			else
+			{
+				Lines.Add({ FString::Printf(TEXT("%d machines picked%s"), Tool.Shown().Num(), Tool.ShownCapped() ? TEXT(" (the most one pick holds)") : TEXT("")), TextMain });
+				Lines.Append(Tool.CountLines);
+				Lines.Add({ FString(TEXT("Choose a recipe in the list below     RMB  clear     Esc  stop")), TextDim });
+			}
+			return PaintCursorCard(AllottedGeometry, OutDrawElements, Layer, Title, Lines, Accent);
+		}
+		if (Tool.Shown().IsEmpty())
+		{
+			Lines.Add({ FString(Tool.bBoxing ? TEXT("Nothing in the box") : TEXT("Click buildings or drag a box to pick them")), TextDim });
+		}
+		else
+		{
+			Lines.Add({ FString::Printf(TEXT("%d picked%s"), Tool.Shown().Num(), Tool.ShownCapped() ? TEXT(" (the most one pick holds)") : TEXT("")), TextMain });
+			Lines.Append(Tool.CountLines);
+			if (!Tool.RefundText.IsEmpty())
+			{
+				Lines.Add({ FString::Printf(TEXT("Gives back %s"), *Tool.RefundText), TextDim });
+			}
+			Lines.Add({ FString(TEXT("Enter  dismantle     RMB  clear     Esc  stop")), TextDim });
+		}
+		return PaintCursorCard(AllottedGeometry, OutDrawElements, Layer, Title, Lines, FLinearColor(FColor(200, 70, 60)));
+	}
+
+	/** In place mode, by the cursor: the building in hand, and its cost or why it can't go here. */
+	int32 PaintPlaceLabel(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements, int32 Layer) const
+	{
+		const UAtlasSubsystem* Atlas = Sub();
+		if (!Atlas || !Atlas->IsPlacing(View) || !GetTickSpaceGeometry().IsUnderLocation(FSlateApplication::Get().GetCursorPos())
+			|| Atlas->IsPointerOverPanel(View))
+		{
+			return Layer;
+		}
+		const FPlaceTool& Place = Atlas->GetPlace();
+		const FLinearColor Bad(FColor(235, 90, 80));
+		FString Title;
+		TArray<TPair<FString, FLinearColor>> Lines;
+		bool bBad = false;
+		if (Place.bRow)
+		{
+			int32 Fit = 0;
+			int32 Blocked = 0;
+			int32 Checking = 0;
+			FString FirstReason;
+			for (const FPlaceSpot& Spot : Place.Row)
+			{
+				Fit += Spot.State == EPlaceSpot::Valid ? 1 : 0;
+				Checking += Spot.State == EPlaceSpot::Unknown ? 1 : 0;
+				if (Spot.State == EPlaceSpot::Blocked)
+				{
+					Blocked++;
+					if (FirstReason.IsEmpty())
+					{
+						FirstReason = Spot.Reason.ToString();
+					}
+				}
+			}
+			Title = FString::Printf(TEXT("%s  x%d%s"), *Place.Name.ToString(), Place.Row.Num(), Place.bManifold ? TEXT(", manifold") : TEXT(""));
+			if (Place.bManifold && !Place.bRowBuilding)
+			{
+				Lines.Add({ Place.ManifoldPorts > 0 ? FString::Printf(TEXT("Lined up with %d machine ports; belts follow"), Place.ManifoldPorts)
+					: FString(TEXT("Belted together once built; no machine ports along the drag")), TextDim });
+			}
+			if (Place.bRowBuilding)
+			{
+				Lines.Add({ FString::Printf(TEXT("Building... %d of %d"), Place.RowBuilt, Place.Row.Num()), TextMain });
+			}
+			else
+			{
+				Lines.Add({ FString::Printf(TEXT("%d fit, %d blocked%s     at %.0f m"), Fit, Blocked, Checking > 0 ? TEXT(", checking") : TEXT(""), Place.HeightMetres), TextMain });
+				if (!Place.CostText.IsEmpty())
+				{
+					Lines.Add({ FString::Printf(TEXT("Each: %s"), *Place.CostText), TextDim });
+				}
+			}
+			if (!FirstReason.IsEmpty())
+			{
+				Lines.Add({ FirstReason, Bad });
+			}
+			bBad = Fit == 0 && Checking == 0 && !Place.bRowBuilding;
+			Lines.Add({ FString(Place.bRowBuilding ? TEXT("Esc  stop") : TEXT("Release to build     RMB / Esc  cancel")), TextDim });
+		}
+		else if (Place.bManifoldBelting)
+		{
+			Title = Place.Name.ToString();
+			Lines.Add({ FString::Printf(TEXT("Laying belts... %d of %d"), Place.ManifoldBelts + Place.ManifoldFailed, Place.ManifoldPlanned), TextMain });
+			Lines.Add({ FString(TEXT("RMB / Esc  stop")), TextDim });
+		}
+		else if (!Place.Recipe)
+		{
+			Title = TEXT("Place");
+			Lines.Add({ FString(TEXT("Q  pick a building     MMB  take a machine in hand")), TextDim });
+			Lines.Add({ FString(TEXT("A blueprint chosen in the build gun comes in hand when the map opens")), TextDim });
+		}
+		else
+		{
+			Title = Place.IsBlueprint() ? FString::Printf(TEXT("Blueprint: %s"), *Place.Name.ToString()) : Place.Name.ToString();
+			if (!Place.bReady)
+			{
+				Lines.Add({ FString(TEXT("Checking...")), TextDim });
+			}
+			else if (!Place.bValid)
+			{
+				Lines.Add({ Place.Reason.IsEmpty() ? FString(TEXT("Can't build this here.")) : Place.Reason.ToString(), Bad });
+				bBad = true;
+			}
+			else if (!Place.CostText.IsEmpty())
+			{
+				Lines.Add({ Place.CostText, TextMain });
+			}
+			if (Place.bHasGhost)
+			{
+				Lines.Add({ FString::Printf(TEXT("At %.0f m"), Place.HeightMetres), TextDim });
+			}
+			if (Place.bSampled)
+			{
+				Lines.Add({ FString(TEXT("Copies get the sample's settings")), TextDim });
+			}
+			if (Place.Built > 0)
+			{
+				Lines.Add({ FString::Printf(TEXT("%d placed"), Place.Built), TextDim });
+			}
+			Lines.Add({ FString(TEXT("R  rotate     RMB  put down     Esc  stop")), TextDim });
+		}
+		return PaintCursorCard(AllottedGeometry, OutDrawElements, Layer, Title, Lines, bBad ? Bad : Accent);
 	}
 
 	/** While a belt is dragged from a port: which belt, which build mode, the keys, and why it can't be built. */
@@ -1617,7 +2454,7 @@ public:
 	{
 		const UAtlasSubsystem* Atlas = Sub();
 		if (!Atlas || !Atlas->GetSettings().bHoverLabel || !Atlas->GetHover().bValid || Atlas->GetHoverView() != View || Atlas->GetHoverName().IsEmpty()
-			|| Atlas->IsDraggingBelt() || Atlas->GetMeasure(View).bPressed || Atlas->IsWiring(View))
+			|| Atlas->IsDraggingBelt() || Atlas->GetMeasure(View).bPressed || Atlas->IsWiring(View) || Atlas->IsPlacing(View) || Atlas->IsPicking(View))
 		{
 			return Layer;
 		}
@@ -1855,6 +2692,22 @@ private:
 				[
 					MakeLabel(TEXT("Collectibles left to find"), Style.FontSmall, TextDim)
 				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(2.f, 0.f, 0.f, 2.f))
+				[
+					// A multiplayer client only learns what was collected where it has been, so say so rather than show
+					// counts that look exact.
+					SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+					.Visibility_Lambda([]()
+					{
+						return Sub() && Sub()->AnyCollectibleShown() && Sub()->GetCollectibleData() != UAtlasSubsystem::ECollectibleData::Exact ? EVisibility::Visible : EVisibility::Collapsed;
+					})
+					.Text_Lambda([]()
+					{
+						return FText::FromString(Sub() && Sub()->GetCollectibleData() == UAtlasSubsystem::ECollectibleData::None
+							? TEXT("Not available here yet.")
+							: TEXT("As a client, Atlas only sees what was collected near you this session. Others may still be counted."));
+					})
+				]
 				+ SVerticalBox::Slot().AutoHeight()[MakeCollectibleRow(ECollectible::Somersloop, MarkerSomersloop)]
 				+ SVerticalBox::Slot().AutoHeight()[MakeCollectibleRow(ECollectible::MercerSphere, MarkerMercerSphere)]
 				+ SVerticalBox::Slot().AutoHeight()[MakeCollectibleRow(ECollectible::HardDrive, MarkerHardDrive)]
@@ -1943,10 +2796,31 @@ private:
 			return SNew(STextBlock).Font(Style.Font).ColorAndOpacity(FSlateColor(TextMain))
 				.Text_Lambda([Text]() { return FText::FromString(Text()); });
 		};
-		const auto Step = [this](const TCHAR* Label, float Points)
+		// Clock presets as exact fractions, so 1/3 lands on 33.3333% and not a rounded step.
+		const auto Preset = [this](const TCHAR* Label, float Value)
 		{
-			return MakeTextButton(FText::FromString(Label), []() { return false; },
-				[this, Points]() { if (Sub()) { Sub()->SetSelectedClock(State.Pending + Points / 100.f); } });
+			return SNew(SBox)
+				.IsEnabled_Lambda([this, Value]() { return Value >= State.Min - 0.000001f && Value <= State.Max + 0.000001f; })
+				[
+					MakeTextButton(FText::FromString(Label),
+						[this, Value]() { return !ClockDraft.IsSet() && FMath::IsNearlyEqual(State.Pending, Value, 0.000002f); },
+						[this, Value]() { if (Sub()) { Sub()->SetSelectedClock(Value); } })
+				];
+		};
+		struct FClockPreset { const TCHAR* Label; float Value; };
+		const auto PresetRow = [&Preset](std::initializer_list<FClockPreset> Items)
+		{
+			TSharedRef<SHorizontalBox> Row = SNew(SHorizontalBox);
+			int32 Index = 0;
+			for (const FClockPreset& Item : Items)
+			{
+				Row->AddSlot().FillWidth(1.f).Padding(FMargin(Index == 0 ? 0.f : 2.f, 0.f, Index + 1 == int32(Items.size()) ? 0.f : 2.f, 0.f))
+				[
+					Preset(Item.Label, Item.Value)
+				];
+				++Index;
+			}
+			return Row;
 		};
 		const auto CanEdit = [this]() { return State.bValid && State.bAuthority && State.bCanChangeClock && State.Max > State.Min; };
 
@@ -2017,10 +2891,18 @@ private:
 							Line([this]()
 							{
 								const float Shown = ClockDraft.IsSet() ? ClockDraft.GetValue() : State.Pending;
-								FString Text = FString::Printf(TEXT("Clock speed  %.1f%%"), Shown * 100.f);
-								if (!ClockDraft.IsSet() && !FMath::IsNearlyEqual(State.Pending, State.Current, 0.0005f))
+								// Up to four decimals, the precision the game's own field takes, without trailing zeros.
+								const auto Percent = [](float Value)
 								{
-									Text += FString::Printf(TEXT("  (now %.1f%%)"), State.Current * 100.f);
+									FString Out = FString::Printf(TEXT("%.4f"), Value * 100.f);
+									while (Out.EndsWith(TEXT("0"))) { Out.LeftChopInline(1); }
+									if (Out.EndsWith(TEXT("."))) { Out.LeftChopInline(1); }
+									return Out + TEXT("%");
+								};
+								FString Text = TEXT("Clock speed  ") + Percent(Shown);
+								if (!ClockDraft.IsSet() && !FMath::IsNearlyEqual(State.Pending, State.Current, 0.000002f))
+								{
+									Text += TEXT("  (now ") + Percent(State.Current) + TEXT(")");
 								}
 								return Text;
 							})
@@ -2052,12 +2934,18 @@ private:
 						]
 						+ SVerticalBox::Slot().AutoHeight()
 						[
-							SNew(SHorizontalBox)
+							SNew(SVerticalBox)
 							.IsEnabled_Lambda(CanEdit)
-							+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(0.f, 0.f, 3.f, 0.f))[Step(TEXT("-10"), -10.f)]
-							+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 3.f, 0.f))[Step(TEXT("-1"), -1.f)]
-							+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 3.f, 0.f))[Step(TEXT("+1"), 1.f)]
-							+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 0.f, 0.f))[Step(TEXT("+10"), 10.f)]
+							+ SVerticalBox::Slot().AutoHeight()
+							[
+								PresetRow({ { TEXT("1/4"), 1.f / 4.f }, { TEXT("1/3"), 1.f / 3.f }, { TEXT("2/5"), 2.f / 5.f },
+									{ TEXT("1/2"), 1.f / 2.f }, { TEXT("3/5"), 3.f / 5.f }, { TEXT("2/3"), 2.f / 3.f } })
+							]
+							+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+							[
+								PresetRow({ { TEXT("3/4"), 3.f / 4.f }, { TEXT("4/5"), 4.f / 5.f }, { TEXT("100%"), 1.f },
+									{ TEXT("150%"), 1.5f }, { TEXT("200%"), 2.f }, { TEXT("250%"), 2.5f } })
+							]
 						]
 						+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 8.f, 0.f, 0.f))
 						[
@@ -2121,6 +3009,10 @@ private:
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(10.f, 8.f, 10.f, 2.f))
 					[
+						MakeUpgradeSection()
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(10.f, 8.f, 10.f, 2.f))
+					[
 						MakeControlsSection()
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(10.f, 8.f, 10.f, 10.f))
@@ -2129,6 +3021,178 @@ private:
 					]
 				]
 			];
+	}
+
+	/** For a belt or lift: replace it and everything downstream of it with another tier. */
+	TSharedRef<SWidget> MakeUpgradeSection()
+	{
+		const FAtlasStyle& Style = FAtlasStyle::Get();
+		const auto Open = []() { return Sub() && Sub()->IsUpgradeOpen(); };
+		const auto Running = []() { return Sub() && Sub()->GetUpgrade().bRunning; };
+		return SNew(SVerticalBox)
+			.Visibility_Lambda([this]() { return State.bValid && Sub() && Sub()->IsSelectedConveyor() ? EVisibility::Visible : EVisibility::Collapsed; })
+			.IsEnabled_Lambda([this]() { return State.bAuthority; })
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+				[
+					MakeLabel(TEXT("Belt line"), Style.FontBold, TextMain)
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+				[
+					SNew(SBox).WidthOverride(70.f)
+					.ToolTip(MakeTip(FText::FromString(TEXT("Upgrade this belt and every belt and lift downstream of it, through the game's own upgrade."))))
+					[
+						MakeTextButton(FText::FromString(TEXT("Upgrade")), Open,
+							[Open]() { if (Sub()) { Sub()->SetUpgradeOpen(!Open()); } })
+					]
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(SVerticalBox)
+				.Visibility_Lambda([Open]() { return Open() ? EVisibility::Visible : EVisibility::Collapsed; })
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+				[
+					SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+					.Text_Lambda([]() { return FText::FromString(UpgradeSummary()); })
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+				[
+					SNew(SBox)
+					.IsEnabled_Lambda([Running]() { return !Running(); })
+					.ToolTip(MakeTip(FText::FromString(TEXT("Carry on past splitters and mergers, down every output, until the belts reach machines or storage."))))
+					[
+						MakeToggleRow(TEXT("Through splitters and mergers"),
+							[]() { return Sub() && Sub()->GetUpgrade().bThroughAttachments; },
+							[]() { if (Sub()) { Sub()->SetUpgradeThroughAttachments(!Sub()->GetUpgrade().bThroughAttachments); } })
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight().MaxHeight(240.f).Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+				[
+					SNew(SBorder)
+					.BorderImage(&Style.White)
+					.BorderBackgroundColor(FSlateColor(RowColor))
+					.Padding(FMargin(2.f))
+					.IsEnabled_Lambda([Running]() { return !Running(); })
+					[
+						SNew(SScrollBox)
+						.Style(&Style.Scroll)
+						.ScrollBarStyle(&Style.ScrollBar)
+						.ScrollBarVisibility(EVisibility::Collapsed)
+						+ SScrollBox::Slot()
+						[
+							SAssignNew(UpgradeList, SVerticalBox)
+						]
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+				[
+					SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+					.Text_Lambda([Running]()
+					{
+						if (Running())
+						{
+							const FUpgradeTool& Tool = Sub()->GetUpgrade();
+							return FText::FromString(FString::Printf(TEXT("Upgrading %d of %d..."), FMath::Min(Tool.Next, Tool.Line.Num()), Tool.Line.Num()));
+						}
+						return FText::FromString(TEXT("Click a tier to upgrade the highlighted line. Items stay on the belts; the old belts' cost comes back."));
+					})
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 8.f, 0.f, 0.f))
+			[
+				SNew(SBox).HeightOverride(1.f)
+				[
+					SNew(SImage).Image(&Style.White).ColorAndOpacity(FSlateColor(RowColor))
+				]
+			];
+	}
+
+	/** "14 belts and 2 lifts, 212 m from here. Ends at the Constructor." */
+	static FString UpgradeSummary()
+	{
+		if (!Sub())
+		{
+			return FString();
+		}
+		const FUpgradeTool& Tool = Sub()->GetUpgrade();
+		const auto Count = [](int32 Number, const TCHAR* One, const TCHAR* Many)
+		{
+			return FString::Printf(TEXT("%d %s"), Number, Number == 1 ? One : Many);
+		};
+		FString Text = Count(Tool.Belts, TEXT("belt"), TEXT("belts"));
+		if (Tool.Lifts > 0)
+		{
+			Text += TEXT(" and ") + Count(Tool.Lifts, TEXT("lift"), TEXT("lifts"));
+		}
+		Text += FString::Printf(TEXT(", %.0f m from here downstream. %s"), Tool.LengthMetres, *Tool.EndText);
+		if (Tool.bCapped)
+		{
+			Text += FString::Printf(TEXT(" Only the first %d are taken."), UAtlasSubsystem::MaxUpgradeLine);
+		}
+		return Text;
+	}
+
+	void RebuildUpgradeList()
+	{
+		if (!UpgradeList || !Sub())
+		{
+			return;
+		}
+		const FAtlasStyle& Style = FAtlasStyle::Get();
+		UpgradeList->ClearChildren();
+		const TArray<FUpgradeTier>& Tiers = Sub()->GetUpgrade().Tiers;
+		if (Tiers.IsEmpty())
+		{
+			UpgradeList->AddSlot().AutoHeight().Padding(FMargin(6.f, 4.f))[MakeLabel(TEXT("No belts unlocked"), Style.FontSmall, TextDim)];
+		}
+		for (int32 Index = Tiers.Num() - 1; Index >= 0; Index--)
+		{
+			const FUpgradeTier& Tier = Tiers[Index];
+			FString Detail;
+			if (Tier.Changes == 0)
+			{
+				Detail = Tier.LiftsStay > 0 ? TEXT("Belts already this tier; no lift this fast unlocked") : TEXT("Already this tier");
+			}
+			else
+			{
+				Detail = FString::Printf(TEXT("Replaces %d. %s."), Tier.Changes, *Tier.CostText);
+				if (Tier.LiftsStay > 0)
+				{
+					Detail += FString::Printf(TEXT(" %d %s stay, with no lift this fast unlocked."), Tier.LiftsStay, Tier.LiftsStay == 1 ? TEXT("lift") : TEXT("lifts"));
+				}
+			}
+			const bool bNothing = Tier.Changes == 0;
+			UpgradeList->AddSlot().AutoHeight()
+			[
+				SNew(SAtlasButton)
+				.ButtonStyle(&Style.Flat)
+				.IsFocusable(false)
+				.ContentPadding(FMargin(6.f, 4.f))
+				.OnClicked_Lambda([Index]()
+				{
+					if (Sub())
+					{
+						Sub()->StartUpgrade(Index);
+					}
+					return FReply::Handled();
+				})
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						MakeLabel(Tier.Name, Style.Font, bNothing ? Accent : TextMain)
+					]
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock).Text(FText::FromString(Detail)).Font(Style.FontSmall)
+						.ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+					]
+				]
+			];
+		}
 	}
 
 	/** A label column for the settings rows, so their controls line up. */
@@ -3036,7 +4100,16 @@ private:
 				SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim))
 				.Text_Lambda([Kind]()
 				{
-					return Sub() && Sub()->IsCollectibleShown(Kind) ? FText::AsNumber(Sub()->GetCollectibleCount(Kind)) : FText::GetEmpty();
+					if (!Sub() || !Sub()->IsCollectibleShown(Kind))
+					{
+						return FText::GetEmpty();
+					}
+					switch (Sub()->GetCollectibleData())
+					{
+					case UAtlasSubsystem::ECollectibleData::None: return FText::FromString(TEXT("?"));
+					case UAtlasSubsystem::ECollectibleData::ClientPartial: return FText::Format(FText::FromString(TEXT("up to {0}")), FText::AsNumber(Sub()->GetCollectibleCount(Kind)));
+					default: return FText::AsNumber(Sub()->GetCollectibleCount(Kind));
+					}
 				})
 			];
 	}
@@ -3050,6 +4123,20 @@ private:
 				if (UAtlasSubsystem* Atlas = Sub())
 				{
 					Atlas->EditSettings().ExportSize = Size;
+					Atlas->SaveSettings();
+				}
+			});
+	}
+
+	TSharedRef<SWidget> MakeExportStyleButton(const TCHAR* Label, bool bRendered)
+	{
+		return MakeTextButton(FText::FromString(Label),
+			[bRendered]() { return Sub() && Sub()->GetSettings().bExportRendered == bRendered; },
+			[bRendered]()
+			{
+				if (UAtlasSubsystem* Atlas = Sub())
+				{
+					Atlas->EditSettings().bExportRendered = bRendered;
 					Atlas->SaveSettings();
 				}
 			});
@@ -3077,6 +4164,24 @@ private:
 				.OnValueChanged_Lambda([](float Value) { if (Sub()) { Sub()->EditSettings().Opacity = 0.2f + Value * 0.8f; } })
 				.OnMouseCaptureEnd_Lambda([]() { if (Sub()) { Sub()->SaveSettings(); } })
 			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 10.f, 0.f, 3.f))[Heading(TEXT("Terrain"))]
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(0.f, 0.f, 3.f, 0.f))[MakeTerrainButton(TEXT("Realistic"), true)]
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 0.f, 0.f))[MakeTerrainButton(TEXT("Game map"), false)]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+			[
+				// The imagery is used with permission, on condition it is credited.
+				SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+				.Text_Lambda([]()
+				{
+					return FText::FromString(Realistic::IsAvailable() ? Realistic::Credit
+						: TEXT("This build of Atlas was made without the realistic imagery."));
+				})
+				.Visibility_Lambda([]() { return Sub() && Sub()->GetSettings().bRealisticTerrain ? EVisibility::Visible : EVisibility::Collapsed; })
+			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 10.f, 0.f, 3.f))[Heading(TEXT("Zoom limit"))]
 			+ SVerticalBox::Slot().AutoHeight()
 			[
@@ -3090,8 +4195,42 @@ private:
 			+ SVerticalBox::Slot().AutoHeight()
 			[
 				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(0.f, 0.f, 3.f, 0.f))[MakeExportSizeButton(TEXT("4096 px"), 4096)]
-				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 0.f, 0.f))[MakeExportSizeButton(TEXT("8192 px"), 8192)]
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(0.f, 0.f, 3.f, 0.f))[MakeExportStyleButton(TEXT("Flat"), false)]
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 0.f, 0.f))[MakeExportStyleButton(TEXT("Rendered"), true)]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 6.f, 0.f, 0.f))
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(0.f, 0.f, 3.f, 0.f))[MakeExportSizeButton(TEXT("4K"), 4096)]
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 3.f, 0.f))[MakeExportSizeButton(TEXT("8K"), 8192)]
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(3.f, 0.f, 0.f, 0.f))[MakeExportSizeButton(TEXT("32K"), 32768)]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+			[
+				SNew(STextBlock).Font(Style.FontSmall).ColorAndOpacity(FSlateColor(TextDim)).AutoWrapText(true)
+				.Text_Lambda([]()
+				{
+					if (!Sub())
+					{
+						return FText::GetEmpty();
+					}
+					const Atlas::FSettings& S = Sub()->GetSettings();
+					FString Text;
+					if (S.bExportRendered)
+					{
+						Text = TEXT("Every building as the game draws it, seen from above. Takes a few minutes, and the game stutters until it is done.");
+					}
+					if (S.ExportSize == 32768)
+					{
+						Text += Text.IsEmpty() ? TEXT("") : TEXT(" ");
+						Text += TEXT("A 32K image is a gigapixel; not every image viewer opens one.");
+					}
+					return FText::FromString(Text);
+				})
+				.Visibility_Lambda([]()
+				{
+					return Sub() && (Sub()->GetSettings().bExportRendered || Sub()->GetSettings().ExportSize == 32768) ? EVisibility::Visible : EVisibility::Collapsed;
+				})
 			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 6.f, 0.f, 0.f))
 			[
@@ -3121,6 +4260,24 @@ private:
 						[this]() { if (Sub()) { Sub()->ResetColors(); } bListDirty = true; })
 				]
 			];
+	}
+
+	TSharedRef<SWidget> MakeTerrainButton(const TCHAR* Label, bool bRealistic)
+	{
+		return MakeTextButton(FText::FromString(Label),
+			[bRealistic]() { return Sub() && Sub()->GetSettings().bRealisticTerrain == bRealistic; },
+			[bRealistic]()
+			{
+				if (UAtlasSubsystem* Atlas = Sub())
+				{
+					Atlas->EditSettings().bRealisticTerrain = bRealistic;
+					Atlas->SaveSettings();
+					if (!bRealistic)
+					{
+						Realistic::Release(); // About 60 MB of tiles and their textures
+					}
+				}
+			});
 	}
 
 	TSharedRef<SWidget> MakeZoomButton(const TCHAR* Label, int32 Factor)
@@ -3165,8 +4322,53 @@ private:
 			const float Low = HeightSlider->GetLow();
 			const float High = HeightSlider->GetHigh();
 			Atlas->SetHeightFilter(Low <= 0.f ? MinHeightMetres : ValueToMetres(Low), High >= 1.f ? MaxHeightMetres : ValueToMetres(High));
+			SyncedFilter = Atlas->GetHeightFilter();
 		}
 	}
+
+	/** Where a filter height sits on the slider. Only the filter's ends sit on the track's ends, which mean off. */
+	float MetresToValue(float Metres) const
+	{
+		if (Metres <= MinHeightMetres)
+		{
+			return 0.f;
+		}
+		if (Metres >= MaxHeightMetres)
+		{
+			return 1.f;
+		}
+		const FVector2f Bounds = Sub() ? Sub()->GetHeightBounds() : FVector2f(0.f, 1.f);
+		return FMath::Clamp((Metres - Bounds.X) / FMath::Max(Bounds.Y - Bounds.X, 1.f), 0.001f, 0.999f);
+	}
+
+	/** Keeps the handles on the filter when something else set it: Alt + wheel, or the other map view. */
+	void SyncHeightSlider(const UAtlasSubsystem& Atlas)
+	{
+		const FVector2f Filter = Atlas.GetHeightFilter();
+		if (HeightSlider && !HeightSlider->HasMouseCapture() && Filter != SyncedFilter)
+		{
+			SyncedFilter = Filter;
+			HeightSlider->SetRange(MetresToValue(Filter.X), MetresToValue(Filter.Y));
+		}
+	}
+
+public:
+	/** Alt + wheel over this view's map steps the height filter through the floors under the cursor. */
+	bool OnFloorWheel(const FPointerEvent& Event)
+	{
+		UAtlasSubsystem* Atlas = Sub();
+		const FVector2f At(Event.GetScreenSpacePosition());
+		if (!Atlas || Event.GetWheelDelta() == 0.f || Atlas->IsPointerOverPanel(View)
+			|| !GetTickSpaceGeometry().IsUnderLocation(Event.GetScreenSpacePosition()) || !Atlas->IsPointOnMap(At, View))
+		{
+			return false;
+		}
+		Atlas->StepFloor(View, Event.GetWheelDelta() > 0.f ? 1 : -1);
+		SyncHeightSlider(*Atlas);
+		return true;
+	}
+
+private:
 
 	FText HeightText() const
 	{
@@ -3379,6 +4581,20 @@ private:
 	TSharedPtr<SAtlasPanelBorder> MeasurePanel;
 	TSharedPtr<SBox> MeasureTile;
 	TSharedPtr<SBox> WireTile;
+	TSharedPtr<SBox> PlaceTile;
+	TSharedPtr<SBox> DismantleTile;
+	TSharedPtr<SBox> RecipeTile;
+	TSharedPtr<SBox> ConnectTile;
+	TSharedPtr<SWidget> RecipePanel;
+	TSharedPtr<SVerticalBox> RecipeGroupList;
+	uint32 BuiltRecipeGroupsVersion = MAX_uint32;
+	TSharedPtr<SWidget> PlacePicker;
+	TSharedPtr<SEditableText> PlaceSearchBox;
+	TSharedPtr<SVerticalBox> PlaceList;
+	FString PlaceSearch;
+	bool bPlacePicker = false;
+	int32 SearchFocusFrames = 0;
+	UClass* FirstPlaceRecipe = nullptr;
 	FVector2f MeasureOffset = FVector2f::ZeroVector;
 	/** Local units of this widget below the bottom of the screen; the hint bar sits above them. */
 	float HintInset = 0.f;
@@ -3411,9 +4627,12 @@ private:
 	TOptional<float> ClockDraft;
 	TSharedPtr<SVerticalBox> RecipeList;
 	bool bRecipePicker = false;
+	TSharedPtr<SVerticalBox> UpgradeList;
+	uint32 BuiltUpgradeVersion = MAX_uint32;
 	TSharedPtr<SVerticalBox> List;
 	TSharedPtr<SVerticalBox> ResourceList;
 	TSharedPtr<SAtlasRangeSlider> HeightSlider;
+	mutable FVector2f SyncedFilter = FVector2f(MinHeightMetres, MaxHeightMetres); // The filter the slider's handles show
 	TSet<int32> Expanded;
 	int32 PickerTarget = INDEX_NONE;
 	bool bListDirty = true;
@@ -3461,6 +4680,12 @@ public:
 
 	virtual bool HandleMouseButtonDownEvent(FSlateApplication&, const FPointerEvent& Event) override
 	{
+		// Basic map: every click goes to the game's map as if Atlas weren't there, so it only pans.
+		if (const UAtlasSubsystem* Atlas = Sub(); Atlas && Atlas->IsBasic())
+		{
+			bDown = false;
+			return false;
+		}
 		// In measure mode a left press on the map measures, unless Space is held, which leaves it to pan the map.
 		// Shift measures a line instead of a box. Press, moves and release then belong to the measure tool.
 		if (Event.GetEffectingButton() == EKeys::LeftMouseButton && !Event.IsControlDown() && !Event.IsAltDown() && !bSpaceHeld)
@@ -3486,6 +4711,33 @@ public:
 				return true;
 			}
 		}
+		// A plain middle click takes the machine under the cursor in hand to place copies of, as in the game. Press
+		// and release are both swallowed when it does.
+		if (Event.GetEffectingButton() == EKeys::MiddleMouseButton && !Event.GetModifierKeys().AnyModifiersDown())
+		{
+			const TSharedPtr<SAtlasHud> Pinned = Hud.Pin();
+			if (Pinned && Pinned->OnMapSample(FVector2f(Event.GetScreenSpacePosition())))
+			{
+				SwallowUp = EKeys::MiddleMouseButton;
+				bDragPaste = false;
+				bDown = false;
+				return true;
+			}
+		}
+		// In place mode a plain left press with a building in hand belongs to the place tool: a click builds one, a
+		// drag lays out a row, Ctrl + drag a manifold. Space held leaves it to pan the map.
+		if (Event.GetEffectingButton() == EKeys::LeftMouseButton && !Event.IsAltDown() && !Event.IsShiftDown() && !bSpaceHeld)
+		{
+			const TSharedPtr<SAtlasHud> Pinned = Hud.Pin();
+			if (Pinned && Pinned->OnMapPlacePress(FVector2f(Event.GetScreenSpacePosition())))
+			{
+				bPlacePress = true;
+				bPlaceMoved = false;
+				PlacePressAt = FVector2f(Event.GetScreenSpacePosition());
+				bDown = false;
+				return true;
+			}
+		}
 		// Ctrl+right click copies the building under the cursor, Ctrl+left click pastes onto it. When one lands on
 		// a building, its press and release are both swallowed, so the map neither pans nor opens its marker menu.
 		const bool bRight = Event.GetEffectingButton() == EKeys::RightMouseButton;
@@ -3496,6 +4748,20 @@ public:
 			{
 				SwallowUp = Event.GetEffectingButton();
 				bDragPaste = !bRight;
+				bDown = false;
+				return true;
+			}
+		}
+		// In dismantle mode a left press picks: a click picks or unpicks the building under it, a drag boxes, and
+		// Shift boxes buildings out of the pick. Space held leaves it to pan the map.
+		if (Event.GetEffectingButton() == EKeys::LeftMouseButton && !Event.IsControlDown() && !Event.IsAltDown() && !bSpaceHeld)
+		{
+			const TSharedPtr<SAtlasHud> Pinned = Hud.Pin();
+			if (Pinned && Pinned->OnMapDismantlePress(FVector2f(Event.GetScreenSpacePosition()), Event.IsShiftDown()))
+			{
+				bDismantlePress = true;
+				bDismantleMoved = false;
+				DismantlePressAt = FVector2f(Event.GetScreenSpacePosition());
 				bDown = false;
 				return true;
 			}
@@ -3528,6 +4794,28 @@ public:
 			if (const TSharedPtr<SAtlasHud> Pinned = Hud.Pin())
 			{
 				Pinned->OnMapMeasureRelease();
+			}
+			return true;
+		}
+		if (bDismantlePress && Event.GetEffectingButton() == EKeys::LeftMouseButton)
+		{
+			bDismantlePress = false;
+			if (UAtlasSubsystem* Atlas = Sub())
+			{
+				Atlas->ReleaseDismantle(Atlas->GetDismantle().View);
+			}
+			return true;
+		}
+		if (bPlacePress && Event.GetEffectingButton() == EKeys::LeftMouseButton)
+		{
+			bPlacePress = false;
+			if (const TSharedPtr<SAtlasHud> Pinned = Hud.Pin())
+			{
+				// A press that never moved is an ordinary click: build one.
+				if (!Pinned->OnMapPlaceRelease() && !bPlaceMoved)
+				{
+					Pinned->OnMapClick(FVector2f(Event.GetScreenSpacePosition()));
+				}
 			}
 			return true;
 		}
@@ -3593,6 +4881,52 @@ public:
 			Pinned->OnMapMeasureMove();
 			return false;
 		}
+		if (bDismantlePress)
+		{
+			UAtlasSubsystem* Atlas = Sub();
+			if (!Atlas || !Atlas->GetDismantle().bPressed || !Event.IsMouseButtonDown(EKeys::LeftMouseButton))
+			{
+				// Cancelled, or the release went somewhere this didn't see.
+				bDismantlePress = false;
+				if (Atlas)
+				{
+					Atlas->CancelDismantleBox();
+				}
+				return false;
+			}
+			if (!bDismantleMoved && FVector2f::Distance(FVector2f(Event.GetScreenSpacePosition()), DismantlePressAt) >= 5.f)
+			{
+				bDismantleMoved = true;
+			}
+			if (bDismantleMoved)
+			{
+				Atlas->MoveDismantle(Atlas->GetDismantle().View);
+			}
+			return false;
+		}
+		if (bPlacePress)
+		{
+			const TSharedPtr<SAtlasHud> Pinned = Hud.Pin();
+			if (!Pinned || !Event.IsMouseButtonDown(EKeys::LeftMouseButton))
+			{
+				// The release went somewhere this didn't see.
+				bPlacePress = false;
+				if (Pinned)
+				{
+					Pinned->OnMapPlaceCancel();
+				}
+				return false;
+			}
+			if (!bPlaceMoved && FVector2f::Distance(FVector2f(Event.GetScreenSpacePosition()), PlacePressAt) >= 5.f)
+			{
+				bPlaceMoved = true;
+			}
+			if (bPlaceMoved)
+			{
+				Pinned->OnMapPlaceMove();
+			}
+			return false;
+		}
 		if (bPortPress)
 		{
 			UAtlasSubsystem* Atlas = Sub();
@@ -3638,6 +4972,10 @@ public:
 			return false;
 		}
 		UAtlasSubsystem* Atlas = Sub();
+		if (Atlas && Atlas->IsBasic())
+		{
+			return false; // Basic map: no tool keys
+		}
 		if (!bPortPress || !Atlas || !Atlas->IsBeltPressed())
 		{
 			// G toggles measure mode and Esc leaves it, for the map under the cursor.
@@ -3670,6 +5008,17 @@ public:
 		return false;
 	}
 
+	/** Alt + wheel over the map steps through floors, and is swallowed so the map doesn't zoom as well. */
+	virtual bool HandleMouseWheelOrGestureEvent(FSlateApplication&, const FPointerEvent& Event, const FPointerEvent* Gesture) override
+	{
+		if (Gesture || !Event.IsAltDown() || Event.IsControlDown() || Event.IsShiftDown())
+		{
+			return false;
+		}
+		const TSharedPtr<SAtlasHud> Pinned = Hud.Pin();
+		return Pinned && Pinned->OnFloorWheel(Event);
+	}
+
 	virtual bool HandleKeyUpEvent(FSlateApplication&, const FKeyEvent& Event) override
 	{
 		if (Event.GetKey() == EKeys::SpaceBar)
@@ -3689,6 +5038,14 @@ private:
 	bool bSpaceHeld = false;
 	/** A left press that landed on a port: this processor owns it, and the belt drag, until release. */
 	bool bPortPress = false;
+	/** A left press in dismantle mode: a click, or a box once it moves. */
+	bool bDismantlePress = false;
+	bool bDismantleMoved = false;
+	FVector2f DismantlePressAt = FVector2f::ZeroVector;
+	/** A left press in place mode with a building in hand: a click, or a row once it moves. */
+	bool bPlacePress = false;
+	bool bPlaceMoved = false;
+	FVector2f PlacePressAt = FVector2f::ZeroVector;
 	/** The button whose release belongs to a swallowed Ctrl-click. */
 	FKey SwallowUp;
 	bool bDragPaste = false;

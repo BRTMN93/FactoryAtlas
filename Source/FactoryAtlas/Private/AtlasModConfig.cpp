@@ -88,6 +88,11 @@ UAtlasModConfig::UAtlasModConfig(const FObjectInitializer& ObjectInitializer)
 
 	const Atlas::FSettings Defaults;
 
+	UCP_Section* Basic = AddSection(Root, TEXT("Basic"), TEXT("Basic map"));
+	AddBool(Basic, TEXT("Enabled"), TEXT("Basic map"),
+		TEXT("Just the buildings. Turns off the hover label and highlight, recipe icons, status lights, ports, collectibles, resources and hazards, and clicking, copying, building and the tools on the map. The Atlas panel opens minimized. Zooming, panning and the panel still work, and your other settings come back when this is off."),
+		Defaults.bBasic);
+
 	UCP_Section* Hover = AddSection(Root, TEXT("Hover"), TEXT("Hover"));
 	AddBool(Hover, TEXT("Label"), TEXT("Show building label"),
 		TEXT("Shows the name of the building under the cursor."), Defaults.bHoverLabel);
@@ -103,11 +108,21 @@ UAtlasModConfig::UAtlasModConfig(const FObjectInitializer& ObjectInitializer)
 		TEXT("Draws an outline around every building."), Defaults.bOutlines);
 	AddBool(Map, TEXT("RecipeIcons"), TEXT("Recipe icons when zoomed in"),
 		TEXT("Shows what each production building makes once the map is zoomed in far enough."), Defaults.bRecipeIcons);
-	AddBool(Map, TEXT("StatusLights"), TEXT("Status lights"),
-		TEXT("A light in each machine's corner: green producing, purple overclocked, yellow standby, red error. Zoomed far out, only the yellow and red ones stay."),
+	AddBool(Map, TEXT("StatusLights"), TEXT("Status lights when zoomed in"),
+		TEXT("A light in each machine's corner once the map is zoomed in far enough: green producing, purple overclocked, yellow standby, red error."),
 		Defaults.bStatusLights);
 	AddBool(Map, TEXT("HideSpoilers"), TEXT("Hide collectibles, resources and hazards"),
 		TEXT("Spoiler-free map: no collectibles, resource nodes, wells, spore flowers, gas pillars or radioactivity."), Defaults.bHideSpoilers);
+
+	UCP_Section* Ports = AddSection(Root, TEXT("Ports"), TEXT("Ports"));
+	AddBool(Ports, TEXT("Belt"), TEXT("Belt ports"),
+		TEXT("Shows free conveyor ports on machines, belts and lifts. Hidden ports can't be dragged from."), Defaults.bBeltPorts);
+	AddBool(Ports, TEXT("Pipe"), TEXT("Pipe ports"),
+		TEXT("Shows free pipe ports on machines and pipelines. Hidden ports can't be dragged from."), Defaults.bPipePorts);
+	AddBool(Ports, TEXT("Hypertube"), TEXT("Hypertube ports"),
+		TEXT("Shows free hypertube ends. Hidden ports can't be dragged from."), Defaults.bHypertubePorts);
+	AddBool(Ports, TEXT("Rail"), TEXT("Railway ends"),
+		TEXT("Shows free railway track ends. Hidden ends can't be dragged from."), Defaults.bRailPorts);
 
 	UCP_Section* Building = AddSection(Root, TEXT("Building"), TEXT("Building from the map"));
 	AddBool(Building, TEXT("AllowClipping"), TEXT("Allow clipping"),
@@ -133,6 +148,9 @@ bool UAtlasModConfig::Read(const UObject* WorldContext, Atlas::FSettings& Settin
 		return false;
 	}
 
+	const UConfigPropertySection* Basic = Cast<UConfigPropertySection>(Root->SectionProperties.FindRef(TEXT("Basic")));
+	ReadBool(Basic, TEXT("Enabled"), Settings.bBasic);
+
 	const UConfigPropertySection* Hover = Cast<UConfigPropertySection>(Root->SectionProperties.FindRef(TEXT("Hover")));
 	ReadBool(Hover, TEXT("Label"), Settings.bHoverLabel);
 	ReadBool(Hover, TEXT("Height"), Settings.bHoverHeight);
@@ -144,6 +162,12 @@ bool UAtlasModConfig::Read(const UObject* WorldContext, Atlas::FSettings& Settin
 	ReadBool(Map, TEXT("RecipeIcons"), Settings.bRecipeIcons);
 	ReadBool(Map, TEXT("StatusLights"), Settings.bStatusLights);
 	ReadBool(Map, TEXT("HideSpoilers"), Settings.bHideSpoilers);
+
+	const UConfigPropertySection* Ports = Cast<UConfigPropertySection>(Root->SectionProperties.FindRef(TEXT("Ports")));
+	ReadBool(Ports, TEXT("Belt"), Settings.bBeltPorts);
+	ReadBool(Ports, TEXT("Pipe"), Settings.bPipePorts);
+	ReadBool(Ports, TEXT("Hypertube"), Settings.bHypertubePorts);
+	ReadBool(Ports, TEXT("Rail"), Settings.bRailPorts);
 
 	const UConfigPropertySection* Building = Cast<UConfigPropertySection>(Root->SectionProperties.FindRef(TEXT("Building")));
 	ReadBool(Building, TEXT("AllowClipping"), Settings.bAllowClipping);

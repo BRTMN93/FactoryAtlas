@@ -219,7 +219,7 @@ void UAtlasSubsystem::RebuildStatusLights()
 	}
 	for (AFGBuildable* Buildable : Buildables->GetAllBuildablesRef())
 	{
-		if (IsValid(Buildable) && !Buildable->GetIsLightweightTemporary() && !Buildable->ManagedByLightweightBuildableSubsystem())
+		if (IsMappedActor(Buildable))
 		{
 			AddStatusLight(Buildable);
 		}

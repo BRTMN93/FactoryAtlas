@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "AtlasTypes.h"
 #include "FGFactoryColoringTypes.h"
+#include "ItemAmount.h"
 #include "FGLightweightBuildableSubsystem.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "Containers/Ticker.h"
@@ -15,6 +16,7 @@ class UFGConnectionComponent;
 class UFGCircuitConnectionComponent;
 class AFGBuildableManufacturer;
 class AFGGameState;
+class UFGBlueprintDescriptor;
 class UTexture2D;
 class USoundBase;
 struct FFactoryCustomizationData;
@@ -37,6 +39,7 @@ namespace Atlas
 		float HalfWidthCm = 0.f; // Splines, wires and beams
 		FVector Center = FVector::ZeroVector;
 		FVector2f Half = FVector2f(100.f, 100.f);
+		float HalfZCm = 0.f; // Half the box's height; records keep its centre, so a floor's top is centre plus this
 		FColor Color = FColor::White;
 		int32 Count = 0;
 		bool bHidden = false;
@@ -213,6 +216,9 @@ namespace Atlas
 	/** Everything on the Settings tab. Saved between sessions. */
 	struct FSettings
 	{
+		// Basic map (Mods > Atlas): just the buildings. While on, SyncModConfig turns the hover, icons, lights, ports
+		// and spoilers below off over the menu's own values, and the map takes no clicks or tool keys.
+		bool bBasic = false;
 		bool bHoverLabel = true;
 		bool bHoverHeight = true;
 		bool bHoverCoordinates = true;
@@ -220,10 +226,17 @@ namespace Atlas
 		bool bOutlines = true;
 		bool bRadiation = false;
 		bool bRecipeIcons = true;
-		bool bStatusLights = false; // A light in each machine's corner showing what it is doing
+		bool bStatusLights = true; // A light in each machine's corner showing what it is doing
 		bool bHideSpoilers = false; // Spoiler-free: no collectibles, resource nodes, wells, spore flowers, gas pillars or radioactivity
+		// Free ports drawn on the map, by kind. A hidden kind can't be dragged from either.
+		bool bBeltPorts = true;
+		bool bPipePorts = true;
+		bool bHypertubePorts = true;
+		bool bRailPorts = true;
+		bool bRealisticTerrain = true; // Satisfactory Calculator's realistic imagery under the map instead of the game's own
 		float Opacity = 1.f;
-		int32 ExportSize = 8192;
+		int32 ExportSize = 8192; // 4096, 8192 or 32768
+		bool bExportRendered = false; // Export the buildings as the game draws them, not as flat shapes
 		int32 ZoomFactor = 4; // Times the game's own zoom limit
 		int32 BeltTierFromTop = 0; // Belts built from the map: 0 is the highest unlocked Mk, 1 the one below, and so on
 		int32 PipeTierFromTop = 0; // The same for pipes
@@ -243,7 +256,15 @@ namespace Atlas
 	{
 		std::atomic<int32> Stage{ 0 }; // 0 idle, 1 working, 2 done, 3 failed
 		FString Path;
+		// A rendered export's progress: tiles captured of those with buildings, then rows written.
+		bool bRendered = false;
+		std::atomic<int32> TilesDone{ 0 };
+		std::atomic<int32> TilesTotal{ 0 };
+		std::atomic<int32> RowsDone{ 0 };
+		int32 Rows = 0;
 	};
+
+	struct FRenderJob;
 
 	/** Which way a measure box's copies run, as seen on the map. */
 	enum class EMeasureDirection : uint8 { Right, Down, Left, Up, Count };
@@ -334,6 +355,200 @@ namespace Atlas
 		FString CostText;
 		float LengthMetres = 0.f;
 	};
+
+	/** A building picked for dismantling: an actor, or a foundation or wall the game keeps as an instance. */
+	struct FDismantleTarget
+	{
+		TWeakObjectPtr<AFGBuildable> Actor;
+		FLightweightBuildableInstanceRef Lightweight;
+		bool bLightweight = false;
+		UClass* Class = nullptr;
+		int32 Index = INDEX_NONE; // The instance's index, for a lightweight
+		TArray<FVector4f> Records; // Its shapes on the map, drawn red while picked
+	};
+
+	/**
+	 * What a pick on the map is for: dismantling it (Alt+F), changing the recipe of every machine in it (Alt+R), or
+	 * wiring everything in it onto one power circuit (Alt+C).
+	 */
+	enum class EPickPurpose : uint8 { Dismantle, Recipe, Power };
+
+	/** One power line connect mode would build, between two connections of picked buildings. */
+	struct FPlannedWire
+	{
+		TWeakObjectPtr<UFGCircuitConnectionComponent> From;
+		TWeakObjectPtr<UFGCircuitConnectionComponent> To;
+		FVector FromLocation = FVector::ZeroVector;
+		FVector ToLocation = FVector::ZeroVector;
+		float Metres = 0.f;
+		TArray<FItemAmount> Cost;
+	};
+
+	/** What connect mode would do with the pick: the wires, what they cost, and what they can't reach. */
+	struct FPowerPlan
+	{
+		TArray<FPlannedWire> Wires;
+		int32 Buildings = 0;      // Picked buildings with a power connection
+		int32 GroupsBefore = 0;   // Separate circuits among them now; unpowered buildings count one each
+		int32 GroupsAfter = 0;    // Left once the wires are built; 1 when everything joins
+		float Metres = 0.f;
+		FString CostText;
+		int32 Affordable = 0;     // How many of the wires, in order, the inventory and Dimensional Depot pay for
+		FString ShortText;        // What runs out first, when not all are affordable
+		TArray<bool> Stranded;    // Per picked building: outside the biggest group once built, drawn red
+	};
+
+	/** One kind of machine in a recipe pick, and the recipes it can be switched to. */
+	struct FRecipeGroup
+	{
+		UClass* Class = nullptr;
+		FText Name;
+		int32 Count = 0;
+		TArray<FRecipeOption> Options;   // By name; the summary is at 100% clock
+		TMap<UClass*, int32> Running;    // How many of the group run each recipe; nullptr for none
+	};
+
+	/**
+	 * Dismantle mode (AtlasDismantle.cpp): click buildings, or drag a box over them, to pick them; Enter dismantles
+	 * what is picked through the game's own dismantle, with the refund going to the inventory as the build gun's does.
+	 * Recipe mode picks the same way, machines only, and switches every picked machine of a kind to a chosen recipe.
+	 */
+	struct FDismantleTool
+	{
+		bool bMode = false;
+		EPickPurpose Purpose = EPickPurpose::Dismantle;
+		EView View = EView::Game;
+		TArray<FRecipeGroup> RecipeGroups; // Recipe mode: the picked machines by kind, most first
+		FPowerPlan Power;                  // Connect mode: the wires that join the pick
+		TArray<FDismantleTarget> Targets;
+		bool bPressed = false;
+		bool bBoxing = false;  // The press moved, so it is a box rather than a click
+		bool bRemove = false;  // Shift: the box takes buildings out of the pick
+		FVector2f PressMetres = FVector2f::ZeroVector;
+		bool bCapped = false;  // A box found more than one pick may hold
+		/** While a box is dragged: the pick as releasing now would leave it, so the map and card show it live. */
+		TArray<FDismantleTarget> Preview;
+		bool bPreview = false;
+		bool bPreviewCapped = false;
+		/** What the map and the cursor card show: the preview while a box is dragged, else the pick. */
+		const TArray<FDismantleTarget>& Shown() const { return bPreview ? Preview : Targets; }
+		bool ShownCapped() const { return bPreview ? bPreviewCapped : bCapped; }
+		FString RefundText;
+		/** How many of each building the pick holds, machines first, ready for the cursor card. */
+		TArray<TPair<FString, FLinearColor>> CountLines;
+	};
+
+	/** One tier a belt line can be changed to: the belt, and the lift of the same speed when one is unlocked. */
+	struct FUpgradeTier
+	{
+		UClass* BeltRecipe = nullptr;
+		UClass* LiftRecipe = nullptr;
+		UClass* Belt = nullptr; // What the recipes build
+		UClass* Lift = nullptr;
+		FText Name;
+		float Speed = 0.f;
+		int32 Changes = 0;   // Belts and lifts on the traced line this tier would replace
+		int32 LiftsStay = 0; // Lifts it can't replace, with no lift of this speed unlocked
+		FString CostText;    // What replacing them costs, net of what the old ones give back
+	};
+
+	/** What one belt or lift replacement came to. */
+	enum class EUpgradeResult : uint8 { Done, Skipped, Unaffordable, Failed };
+
+	/**
+	 * Upgrading a belt line (AtlasUpgrade.cpp): from the selected belt or lift, a trace follows the items downstream,
+	 * and every belt and lift on the way is replaced by the chosen tier through the game's own upgrade.
+	 */
+	struct FUpgradeTool
+	{
+		bool bOpen = false;
+		bool bThroughAttachments = false; // Carry on through splitters and mergers, down every output
+		TArray<TWeakObjectPtr<AFGBuildable>> Line; // In trace order, the selected one first
+		int32 Belts = 0;
+		int32 Lifts = 0;
+		float LengthMetres = 0.f;
+		FString EndText; // Where the line stops
+		bool bCapped = false;
+		TArray<FUpgradeTier> Tiers;
+
+		bool bRunning = false;
+		int32 Tier = INDEX_NONE;
+		int32 Next = 0;
+		int32 Done = 0;
+		int32 Skipped = 0;
+		FText FirstSkip;
+		TMap<UClass*, int32> Overflow; // Given back but didn't fit in the inventory
+	};
+
+	/** Where a spot in a row stands: not looked at yet, the game would build it, it wouldn't, or it is built. */
+	enum class EPlaceSpot : uint8 { Unknown, Valid, Blocked, Built };
+
+	/** One building of a row dragged out in place mode. */
+	struct FPlaceSpot
+	{
+		FVector Target = FVector::ZeroVector; // Where the cursor would be to place it
+		FTransform Ghost = FTransform::Identity; // Where the hologram put it, once looked at
+		EPlaceSpot State = EPlaceSpot::Unknown;
+		FText Reason;
+		TWeakObjectPtr<AFGBuildable> Building; // Once built
+	};
+
+	/** A building the place picker offers: an unlocked recipe whose product stands on a floor. */
+	struct FPlaceOption
+	{
+		UClass* Recipe = nullptr;
+		FText Name;
+		const TCHAR* Group = TEXT("");
+	};
+
+	/**
+	 * Place mode (AtlasPlace.cpp): a building in hand follows the cursor through the game's own hologram, landing
+	 * on the floor the height filter shows, and a click builds it. A building sampled from the map comes with its
+	 * settings: every copy gets them through the clipboard, as a Ctrl + left click would paste them.
+	 */
+	struct FPlaceTool
+	{
+		bool bMode = false;
+		EView View = EView::Game;
+		UClass* Recipe = nullptr; // What is in hand; none until one is picked or sampled
+		FText Name;
+		bool bSampled = false;    // Copies get the sampled building's settings
+		/** A blueprint in hand, taken from the build gun; Recipe is then the game's shared blueprint recipe. */
+		TWeakObjectPtr<UFGBlueprintDescriptor> Blueprint;
+		bool bBlueprint = false; // Stays set if the descriptor goes away, so the hologram is never made without it
+		bool IsBlueprint() const { return bBlueprint; }
+		bool bHasGround = false;  // Something to stand on under the cursor
+		bool bReady = false;      // The hologram has settled where the cursor is, so Valid and Reason can be trusted
+		bool bValid = false;
+		FText Reason;
+		FString CostText;
+		/** Where the hologram is now, for the ghost on the map: its footprint's centre, half size and yaw. */
+		bool bHasGhost = false;
+		FVector GhostCenter = FVector::ZeroVector;
+		FVector2f GhostHalf = FVector2f::ZeroVector;
+		float GhostYaw = 0.f; // Radians
+		FTransform GhostTransform = FTransform::Identity;
+		FVector GhostBoxCenter = FVector::ZeroVector; // The footprint's centre relative to the building
+		/** The building's belt, pipe and hypertube ports, relative to the building, drawn on the ghost. */
+		TArray<FPort> GhostPorts;
+		int32 Built = 0;      // Placed since this building was taken in hand
+		float HeightMetres = 0.f; // Where it will stand, for the card by the cursor
+		/** A row being dragged out, each spot checked with the hologram in turn, then built on release. */
+		bool bRow = false;
+		bool bRowBuilding = false;
+		TArray<FPlaceSpot> Row;
+		int32 RowBuilt = 0;
+		int32 RowFailed = 0;
+		FText RowReason; // Why the first spot that failed while building did
+		/** Ctrl held on a row of splitters or mergers: lined up with the machines' ports, then belted to them and each other. */
+		bool bManifold = false;
+		int32 ManifoldPorts = 0;   // Machine ports the row lined up with
+		bool bManifoldBelting = false;
+		int32 ManifoldBelts = 0;   // Belts built so far
+		int32 ManifoldPlanned = 0;
+		int32 ManifoldFailed = 0;
+		FText ManifoldReason;
+	};
 }
 
 /**
@@ -358,6 +573,8 @@ public:
 
 	// Data
 	void OnMapOpened();
+	/** A view's map went away: lets go of any port, wire, hologram or drag it was holding. */
+	void OnMapClosed(Atlas::EView View);
 	void EnsureScanned();
 	void Pump();
 	bool IsScanned() const { return bScanned; }
@@ -377,6 +594,8 @@ public:
 	void SetLayerEnabled(bool bEnabled);
 	bool IsPanelOpen() const { return bPanelOpen; }
 	void SetPanelOpen(bool bOpen);
+	/** Basic map opens with the panel minimized. Not saved, so turning Basic map off brings back the usual state. */
+	void MinimizePanelForBasic() { if (Settings.bBasic) { bPanelOpen = false; } }
 	/** The map fills the whole map screen, without the game's window frame and filter list. */
 	bool IsFullscreen() const { return bFullscreen; }
 	void SetFullscreen(bool bInFullscreen);
@@ -389,6 +608,10 @@ public:
 	void SaveSettings() const;
 	/** Pulls the toggles that live in the mod settings menu (Mods > Atlas) into Settings. */
 	void SyncModConfig();
+	/** Basic map is on: the map shows the buildings and takes no clicks or tool keys. */
+	bool IsBasic() const { return Settings.bBasic; }
+	/** Lets go of every tool and the selection, for Basic map. */
+	void LeaveMapTools();
 
 	// Colours chosen by the player, per category or per building type
 	FColor GetCategoryDisplayColor(Atlas::ECategory Category) const;
@@ -410,6 +633,11 @@ public:
 	bool AreSpoilersHidden() const { return Settings.bHideSpoilers; }
 	void SetSpoilersHidden(bool bHidden);
 	int32 GetCollectibleCount(Atlas::ECollectible Kind) const { return CollectibleCounts[int32(Kind)]; }
+	/** How far the collectible counts can be trusted. A multiplayer client cannot know everything the host knows. */
+	enum class ECollectibleData : uint8 { None, Exact, ClientPartial };
+	ECollectibleData GetCollectibleData() const { return CollectibleData; }
+	/** The counts are only gathered while at least one collectible is shown. */
+	bool AnyCollectibleShown() const { return !Settings.bHideSpoilers && CollectibleMask != 0; }
 
 	/** Name for the hover label, building or collectible. */
 	FText GetHoverName() const;
@@ -513,6 +741,11 @@ public:
 	FVector2f GetHeightBounds() const;
 	FVector2f GetHeightFilter() const { return FVector2f(FilterLow, FilterHigh); }
 	void SetHeightFilter(float Low, float High);
+	/**
+	 * Alt + wheel: moves the height filter one floor up (Direction > 0) or down. Floors are the foundation tops
+	 * around the cursor. Past the top or bottom floor the filter opens up to every height again.
+	 */
+	void StepFloor(Atlas::EView View, int32 Direction);
 
 	UTexture2D* GetPalette();
 	void FlushPalette();
@@ -537,6 +770,7 @@ public:
 	// Export
 	void StartExport();
 	FText GetExportStatus() const;
+	bool IsExporting() const { return ExportState && ExportState->Stage.load() == 1; }
 
 	// Recipe icons
 	/** Production buildings with a recipe set. Rebuilt at most twice a second, so recipe changes show up quickly. */
@@ -589,6 +823,92 @@ public:
 	bool DropWire();
 	const Atlas::FWireTool& GetWire() const { return Wire; }
 
+	// Placing buildings (AtlasPlace.cpp)
+	bool IsPlacing(Atlas::EView View) const { return Place.bMode && Place.View == View; }
+	/** Place mode on or off for a view. On turns wire and measure mode off; only one view places at a time. */
+	void SetPlacing(Atlas::EView View, bool bOn);
+	/** Puts the building a recipe makes in hand, with default settings, turning place mode on. */
+	void SetPlaceRecipe(Atlas::EView View, UClass* Recipe);
+	/**
+	 * Takes the blueprint the build gun holds in hand on the map, turning place mode on. False, saying nothing, when
+	 * the build gun holds no blueprint.
+	 */
+	bool TakeBuildGunBlueprint(Atlas::EView View);
+	/** Middle click: takes the building under the cursor in hand with its settings. False when there is none to take. */
+	bool SampleHovered(Atlas::EView View);
+	/** A click on the map in place mode: builds what is in hand where the ghost is. */
+	void ClickPlace(Atlas::EView View);
+	/** Puts down what is in hand, staying in place mode. False when nothing was. */
+	bool DropPlace();
+	/** A left press on the map with a building in hand: true when it may become a row drag. */
+	bool PressPlaceRow(Atlas::EView View);
+	/** The press moved: lays the row out from where the press began to the cursor. */
+	void MovePlaceRow(Atlas::EView View);
+	/** The press ended: true when it was a row, which is then built. False means an ordinary click. */
+	bool ReleasePlaceRow(Atlas::EView View);
+	/** Drops the row being dragged, or stops building one. */
+	void CancelPlaceRow();
+	/** R turns the building in hand a quarter turn, or one fine step; Direction is 1 or -1. */
+	void RotatePlace(int32 Direction, bool bFine);
+	const Atlas::FPlaceTool& GetPlace() const { return Place; }
+	/** Everything the picker offers, by group then name. */
+	TArray<Atlas::FPlaceOption> GetPlaceOptions() const;
+
+	// Dismantling (AtlasDismantle.cpp)
+	static constexpr int32 MaxDismantleTargets = 1000;
+	/** Either pick mode, dismantle or recipe, is on in this view: clicks and boxes pick buildings. */
+	bool IsPicking(Atlas::EView View) const { return Dismantle.bMode && Dismantle.View == View; }
+	bool IsDismantling(Atlas::EView View) const { return IsPicking(View) && Dismantle.Purpose == Atlas::EPickPurpose::Dismantle; }
+	bool IsChangingRecipes(Atlas::EView View) const { return IsPicking(View) && Dismantle.Purpose == Atlas::EPickPurpose::Recipe; }
+	bool IsConnecting(Atlas::EView View) const { return IsPicking(View) && Dismantle.Purpose == Atlas::EPickPurpose::Power; }
+	/** A pick mode on or off for a view. On turns the other map tools off, and starts an empty pick; off ends either mode. */
+	void SetPicking(Atlas::EView View, Atlas::EPickPurpose Purpose, bool bOn);
+	void SetDismantling(Atlas::EView View, bool bOn) { SetPicking(View, Atlas::EPickPurpose::Dismantle, bOn); }
+	void SetChangingRecipes(Atlas::EView View, bool bOn) { SetPicking(View, Atlas::EPickPurpose::Recipe, bOn); }
+	void SetConnecting(Atlas::EView View, bool bOn) { SetPicking(View, Atlas::EPickPurpose::Power, bOn); }
+	/** Connect mode: builds the planned power lines (AtlasWires.cpp), paid like the build gun, then clears the pick. */
+	void ConnectPicked();
+	/** Goes up whenever the recipe pick's groups change, so the recipe list knows to rebuild. */
+	uint32 GetRecipeGroupsVersion() const { return RecipeGroupsVersion; }
+	/** Recipe mode: switches every picked machine of the class to Recipe, as each machine's own screen would. */
+	void SetPickedRecipe(UClass* MachineClass, UClass* Recipe);
+	const Atlas::FDismantleTool& GetDismantle() const { return Dismantle; }
+	/** A left press on the map in dismantle mode: a click picks or unpicks, a drag boxes. bRemove boxes buildings out. */
+	bool PressDismantle(Atlas::EView View, bool bRemove);
+	void MoveDismantle(Atlas::EView View);
+	void ReleaseDismantle(Atlas::EView View);
+	void CancelDismantleBox();
+	/** Unpicks everything. False when nothing was picked. */
+	bool ClearDismantle();
+	/** Dismantles everything picked. */
+	void DismantlePicked();
+	/** The picked buildings' shapes in red, for the map. */
+	const TArray<FVector4f>& GetDismantleRecords(uint32& OutVersion) const
+	{
+		OutVersion = DismantleVersion;
+		return DismantleRecords;
+	}
+
+	// Upgrading a belt line (AtlasUpgrade.cpp)
+	static constexpr int32 MaxUpgradeLine = 2000;
+	/** True when the selection is a belt or a lift, so its line can be upgraded. */
+	bool IsSelectedConveyor() const;
+	bool IsUpgradeOpen() const { return Upgrade.bOpen; }
+	/** Opening traces the line from the selection and shows it on the map; closing drops the trace. */
+	void SetUpgradeOpen(bool bOpen);
+	void SetUpgradeThroughAttachments(bool bThrough);
+	const Atlas::FUpgradeTool& GetUpgrade() const { return Upgrade; }
+	/** Goes up whenever the trace or its tiers change, so the panel knows to rebuild its list. */
+	uint32 GetUpgradeVersion() const { return UpgradeVersion; }
+	/** Traces the line again and replaces every belt and lift on it with the given tier, a few each frame. */
+	void StartUpgrade(int32 Tier);
+	/** The traced line's shapes in the accent colour, for the map. */
+	const TArray<FVector4f>& GetUpgradeRecords(uint32& OutVersion) const
+	{
+		OutVersion = UpgradeVersion;
+		return UpgradeRecords;
+	}
+
 	// Status lights (AtlasStatus.cpp)
 	/** One record per machine with a light, drawn by the status material. Null when the lights are off. */
 	const Atlas::FGrid* GetStatusGrid() const { return bStatusActive ? StatusGrid.Get() : nullptr; }
@@ -627,6 +947,8 @@ private:
 
 	int32 TypeFor(UClass* Class);
 	int32 PaintFor(const FFactoryCustomizationData& Data);
+	/** True for a placed building Atlas should draw: not a lightweight stand-in, and not a part the HUB spawns for itself. */
+	static bool IsMappedActor(const AFGBuildable* Buildable);
 	void QueueActor(AFGBuildable* Buildable, bool bAdded);
 	void Scan();
 	void LaunchJob(TSharedPtr<Atlas::FGrid> Replacement);
@@ -694,6 +1016,13 @@ private:
 	TMap<UClass*, int32> MarkerOfClass;
 
 	void GatherCollectibles();
+	ECollectibleData CollectibleData = ECollectibleData::None;
+	// The game records collected pickups and looted drop pods only on the host and never replicates
+	// that, so a client learns them itself: pickups it sees destroyed, drop pods it sees looted.
+	void OnActorDestroyed(AActor* Actor);
+	FDelegateHandle ActorDestroyedHandle;
+	TSet<FGuid> ClientGonePickups;
+	TSet<FGuid> ClientLootedPods;
 	void GatherWorldFeatures();
 	int32 ResourceMarkerFor(UClass* Descriptor, bool bWell);
 	void LoadFeatureCache();
@@ -735,6 +1064,8 @@ private:
 	UClass* SelectionClass() const;
 	/** Selects the hovered building, runs Action on it, then puts the previous selection back. */
 	bool ActOnHovered(TFunctionRef<void()> Action, TSet<const void*>* Done);
+	/** The same for whatever Select picks; Select returns false when there is nothing to act on. */
+	bool ActOnSelection(TFunctionRef<bool()> Select, TFunctionRef<void()> Action, TSet<const void*>* Done);
 	FText Toast;
 	bool bToastError = false;
 	double ToastUntil = 0.0;
@@ -745,8 +1076,8 @@ private:
 	FVector2f SelectionAnchor[int32(Atlas::EView::Count)] = {};
 	float SelectionAnchorRadius[int32(Atlas::EView::Count)] = {};
 	TWeakPtr<SWidget> MapWidget[int32(Atlas::EView::Count)];
-	float FilterLow = -200.f;
-	float FilterHigh = 3895.f;
+	float FilterLow = Atlas::HeightFilterMinMetres;
+	float FilterHigh = Atlas::HeightFilterMaxMetres;
 
 	TSet<TWeakObjectPtr<AFGBuildableManufacturer>> Manufacturers;
 	TArray<Atlas::FRecipeIcon> RecipeIcons;
@@ -780,6 +1111,11 @@ private:
 	int32 BeltHitVariant = 0; // Which way of aiming at a port the hologram accepted, see HitAtPort
 	int32 BeltSettleFrames = 0;
 	FTSTicker::FDelegateHandle BeltTicker;
+	/** The belt tool is building a line between two given ports on its own, for a manifold, not following the cursor. */
+	bool bBeltAuto = false;
+	bool StartAutoBelt(const Atlas::FPort& Start, const Atlas::FPort& Target);
+	/** The automatic belt has the game's verdict: builds it when valid. */
+	void FinishAutoBelt();
 	void RebuildPorts();
 	bool IsPortShown(const Atlas::FPort& Port);
 	int32& TierFromTop(Atlas::EPortKind Kind);
@@ -819,7 +1155,148 @@ private:
 	/** The building whose record is under the cursor, for buildings that are actors (not foundations or walls). */
 	AFGBuildable* FindHoveredActor();
 
+	// Dismantling
+	Atlas::FDismantleTool Dismantle;
+	TArray<FVector4f> DismantleRecords;
+	uint32 DismantleVersion = 0;
+	uint32 RecipeGroupsVersion = 0;
+	FTSTicker::FDelegateHandle DismantleTicker;
+	FVector2f DismantlePreviewEnd = FVector2f::ZeroVector;
+	double DismantlePreviewNext = 0.0;
+	/** While a box is dragged, works out what it would pick, as often as the save's size allows. */
+	bool TickDismantle();
+	void StopDismantleTicker();
+	/** Puts the box from the press to End into a pick, or takes it out of one. */
+	void ApplyDismantleBox(TArray<Atlas::FDismantleTarget>& Into, const FVector2f& End, bool bRemove, bool& bOutCapped);
+	void RefreshDismantle();
+	/** Fills the pick's per-building counts. */
+	void CountDismantle();
+	/** Recipe mode: groups the picked machines by kind, with the recipes each kind can run. */
+	void GroupRecipes();
+	/** Whether the current pick mode takes this building: anything to dismantle, only manufacturers for recipes. */
+	bool PickAccepts(const Atlas::FDismantleTarget& Target) const;
+	/** Connect mode: plans the power lines that join the pick into one circuit (AtlasWires.cpp). */
+	void PlanPower();
+	/** Changes one machine's recipe the way its own screen does: its items go to the player first. */
+	bool SetMachineRecipe(AFGBuildable* Building, UClass* Recipe);
+	/** The building under the cursor as a dismantle target, with its map shapes. */
+	bool FindHoveredTarget(Atlas::FDismantleTarget& Out);
+	/** A dismantle target for a given actor, or a given instance of a lightweight class, with its map shapes. */
+	bool TargetForActor(AFGBuildable* Building, Atlas::FDismantleTarget& Out);
+	bool TargetForInstance(UClass* Class, int32 Index, Atlas::FDismantleTarget& Out);
+	/** Every building the map shows with a shape inside the box (map metres), up to Limit. */
+	void CollectTargetsInBox(const FVector2f& Min, const FVector2f& Max, TArray<Atlas::FDismantleTarget>& Out, int32 Limit, bool& bOutCapped,
+		Atlas::EPickPurpose Purpose = Atlas::EPickPurpose::Dismantle);
+	/** Whether a building can be wired: a power connection a wire can reach, and not a switch, whose two sides must stay apart. */
+	static bool IsWirable(const AFGBuildable* Building);
+
+	// Upgrading a belt line
+	Atlas::FUpgradeTool Upgrade;
+	TArray<FVector4f> UpgradeRecords;
+	uint32 UpgradeVersion = 0;
+	FTSTicker::FDelegateHandle UpgradeTicker;
+	/** Follows the selection downstream into Upgrade.Line, and works out what each tier would do to it. */
+	void TraceUpgrade();
+	void RefreshUpgradeRecords();
+	bool TickUpgrade();
+	void FinishUpgrade(const FText& Stopped);
+	void StopUpgradeTicker();
+	/** Replaces one belt or lift with the tier's, through the game's upgrade hologram. OutNew is the replacement. */
+	Atlas::EUpgradeResult UpgradeOne(AFGBuildable* Old, const Atlas::FUpgradeTier& Tier, FText& OutReason, AFGBuildable*& OutNew);
+	/** What replacing Old with Recipe's building costs, less what Old gives back. Negative amounts come back. */
+	void UpgradeNetCost(AFGBuildable* Old, UClass* Recipe, TMap<UClass*, int32>& InOutNet) const;
+
+	// Placing buildings
+	Atlas::FPlaceTool Place;
+	TWeakObjectPtr<class AFGHologram> PlaceHologram;
+	FTSTicker::FDelegateHandle PlaceTicker;
+	int32 PlaceSettleFrames = 0;
+	/** What the hologram was last placed for; any change places it again. */
+	FVector2f PlaceAimUv = FVector2f(-1.f, -1.f);
+	FVector2f PlaceAimFilter = FVector2f::ZeroVector;
+	bool bPlaceAimDirty = true;
+	/** The hologram's scroll rotation, kept so each new hologram faces the way the last one did. */
+	int32 PlaceRotation = 0;
+	/** The footprint of the building in hand, from its clearance box, relative to the actor. */
+	FVector PlaceBoxCenter = FVector::ZeroVector;
+	FVector2f PlaceBoxHalf = FVector2f::ZeroVector;
+	/** A building just placed from a sample, given the sample's settings a couple of frames later. */
+	struct FPlacePaste
+	{
+		TWeakObjectPtr<AFGBuildable> Building;
+		int32 Frames = 0;
+		FText Name;
+		bool bAnnounce = false; // Say so when it worked; a row says its own
+	};
+	TArray<FPlacePaste> PlacePastes;
+	/** Gives copies waiting for the sample's settings their settings: those whose wait is over, or all. */
+	void FlushPlacePaste(bool bAll);
+	// The row being dragged
+	bool bRowPressed = false;
+	FTransform RowOrigin = FTransform::Identity;
+	int32 RowAxis = -1; // 0 the building's X, 1 its Y
+	int32 RowSign = 1;
+	double RowStep = 0.0;
+	int32 RowCursor = INDEX_NONE; // The spot the hologram is on
+	int32 RowStage = 0;
+	int32 RowWait = 0;
+	void TickPlaceRow();
+	/** A manifold row was built: works out the belts between its pieces and to the machines, and starts on them. */
+	void PlanManifold();
+	/** Starts the next manifold belt, or says what was built when there are none left. */
+	void NextManifoldBelt();
+	TArray<TPair<Atlas::FPort, Atlas::FPort>> ManifoldJobs; // Output port first, then the input it runs to
+	/** The free belt ports of a building, as the belt tool describes them. */
+	void BeltPortsOf(AFGBuildable* Building, TArray<Atlas::FPort>& Out) const;
+	/** Whether the building in hand is a splitter or merger whose row can be a manifold, and which way it carries. */
+	bool PlaceIsAttachment(bool& bOutSplitter) const;
+	void FinishPlaceRow(bool bStopped);
+	/** The game's blueprint group a row (and its manifold belts) is built into, so it dismantles as one. */
+	TWeakObjectPtr<class AFGBlueprintProxy> PlaceGroup;
+	/** Puts something just built from a row into the row's group, making the group with the first one. */
+	void GroupPlaced(AActor* Built, UClass* BuildClass, bool bLightweight, const FTransform& Where);
+	/** Builds what the hologram holds. False, with the reason, when the game built nothing. */
+	bool ConstructPlace(FText& OutError, AActor** OutBuilt = nullptr);
+	bool TickPlace();
+	bool SpawnPlaceHologram();
+	void DestroyPlaceHologram();
+	/** Puts the hologram where the build gun would land looking down at Spot. False when there is nothing there. */
+	bool AimPlaceAt(const FVector& Spot);
+	/** The hit the hologram was last aimed with, and the one the row being dragged started from. */
+	FHitResult PlaceLastHit;
+	/**
+	 * Holding a foundation beside a visible foundation that stands higher than what is under the cursor: the hit on
+	 * that foundation's side facing the cursor, so the new one snaps alongside it at its height, as aiming at a
+	 * foundation's edge does with the build gun.
+	 */
+	bool FindFoundationSideHit(const FVector& Spot, double BelowZ, const AFGHologram* Live, FHitResult& Out) const;
+	FHitResult RowOriginHit;
+	/** The floor a row of machines stands on: the height most of its spots look down onto, in cm. */
+	double RowFloorZ = 0.0;
+	/** Looks down at each spot of the row and keeps the height most of them share, so one hole can't sink the row. */
+	void PickRowFloor();
+	/** Aims the hologram where the row's first piece went, then moves it along the row to Spot, keeping its height. */
+	bool AimPlaceRowSpot(const Atlas::FPlaceSpot& Spot);
+	void ValidatePlace();
+	void BuildPlace();
+	void TakeInHand(Atlas::EView View, UClass* Recipe, bool bSampled);
+	/** The blueprint the build gun holds, and the recipe it builds with; null when it holds none. */
+	UFGBlueprintDescriptor* BuildGunBlueprint(UClass*& OutRecipe) const;
+	/** A map view was just opened: the build gun's blueprint, if any, goes in hand there. */
+	void OnMapOpened(Atlas::EView View);
+	FTSTicker::FDelegateHandle MapOpenTicker;
+	/** Selects Actor, runs Action on it, then puts the previous selection back, like a Ctrl-click does. */
+	bool ActOnActor(AFGBuildable* Actor, TFunctionRef<void()> Action);
+
 	TSharedPtr<Atlas::FExportState> ExportState;
+
+	// Rendered export (AtlasRender.cpp): the world captured from above, tile by tile, a few tiles a frame.
+	void StartRenderExport();
+	bool TickRenderExport(float DeltaSeconds);
+	/** Ends a rendered export, waiting for writes still running. A failed one leaves no file. */
+	void StopRenderExport(bool bFailed);
+	TSharedPtr<Atlas::FRenderJob> RenderJob;
+	FTSTicker::FDelegateHandle RenderTicker;
 
 	FVector2f MapOrigin[int32(Atlas::EView::Count)] = {};
 	FVector2f MapScale[int32(Atlas::EView::Count)] = {};

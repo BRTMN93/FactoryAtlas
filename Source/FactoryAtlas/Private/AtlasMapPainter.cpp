@@ -2,6 +2,9 @@
 
 #include "AtlasSubsystem.h"
 #include "AtlasTypes.h"
+#include "Algo/BinarySearch.h"
+#include "Algo/StableSort.h"
+#include "Brushes/SlateColorBrush.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
 #include "Engine/Texture2D.h"
 #include "FactoryAtlas.h"
@@ -28,6 +31,9 @@ namespace AtlasPainterDetail
 	constexpr float IconMinPixels = 12.f;
 	constexpr float IconMaxPixels = 48.f;
 
+	// Status lights only show from this zoom on, the same as recipe icons: zoomed out they are just noise.
+	constexpr float StatusMinPixelsPerMetre = 1.5f;
+
 	ISlateRHIRendererModule& Renderer()
 	{
 		return FModuleManager::Get().LoadModuleChecked<ISlateRHIRendererModule>(TEXT("SlateRHIRenderer"));
@@ -41,7 +47,10 @@ bool FAtlasMapPainter::HasAnythingToDraw(const UAtlasSubsystem& Atlas)
 
 void FAtlasMapPainter::Reset()
 {
-	Cells.Reset();
+	Slabs.Reset();
+	CellVersions.Reset();
+	CellSlabs.Reset();
+	DirtySlabs = FSlabMask();
 	StatusCells.Reset();
 	HitsBuffer.Reset();
 	HitsVersion = 0;
@@ -139,7 +148,7 @@ void FAtlasMapPainter::Upload(UAtlasSubsystem& Atlas)
 	int64 Budget = AtlasPainterDetail::UploadBudgetBytes;
 	if (const FGrid* Grid = Atlas.GetGrid())
 	{
-		UploadGrid(*Grid, Cells, Budget);
+		UploadSlabs(*Grid, Budget);
 	}
 	if (const FGrid* Status = Atlas.GetStatusGrid())
 	{
@@ -178,6 +187,79 @@ void FAtlasMapPainter::UploadGrid(const FGrid& Grid, TArray<FCellBuffer>& Out, i
 		}
 		Cell.Buffer->Update(Data);
 		Budget -= int64(Source.Num()) * sizeof(FVector4f);
+	}
+}
+
+void FAtlasMapPainter::UploadSlabs(const FGrid& Grid, int64& Budget)
+{
+	if (Slabs.Num() != SlabCount)
+	{
+		Slabs.SetNum(SlabCount);
+		CellVersions.Init(0, GridCells);
+		CellSlabs.SetNum(GridCells);
+		DirtySlabs = FSlabMask();
+	}
+
+	// A changed cell dirties the slabs it was in and the slabs it is in now: its records may have moved, gone or come.
+	for (int32 i = 0; i < GridCells; i++)
+	{
+		if (CellVersions[i] == Grid.Versions[i])
+		{
+			continue;
+		}
+		CellVersions[i] = Grid.Versions[i];
+		FSlabMask Now;
+		for (const FVector4f& Record : Grid.Cells[i])
+		{
+			const int32 Slab = DecodeZ(Record) / SlabSteps;
+			Now.Words[Slab >> 6] |= uint64(1) << (Slab & 63);
+		}
+		for (int32 Word = 0; Word < SlabWords; Word++)
+		{
+			DirtySlabs.Words[Word] |= CellSlabs[i].Words[Word] | Now.Words[Word];
+		}
+		CellSlabs[i] = Now;
+	}
+
+	for (int32 Slab = 0; Slab < SlabCount && Budget > 0; Slab++)
+	{
+		const int32 Word = Slab >> 6;
+		const uint64 Bit = uint64(1) << (Slab & 63);
+		if (!(DirtySlabs.Words[Word] & Bit))
+		{
+			continue;
+		}
+		DirtySlabs.Words[Word] &= ~Bit;
+
+		// Each cell is sorted by height, so its part of the slab is one contiguous run.
+		const int32 Low = Slab * SlabSteps;
+		const int32 High = Low + SlabSteps;
+		FSlateInstanceBufferData Data;
+		for (int32 i = 0; i < GridCells; i++)
+		{
+			if (!(CellSlabs[i].Words[Word] & Bit))
+			{
+				continue;
+			}
+			const TArray<FVector4f>& Cell = Grid.Cells[i];
+			const int32 First = Algo::LowerBoundBy(Cell, Low, &DecodeZ);
+			const int32 Last = Algo::LowerBoundBy(Cell, High, &DecodeZ);
+			Data.Append(Cell.GetData() + First, Last - First);
+		}
+		Algo::StableSortBy(Data, &DecodeZ);
+
+		FSlab& Out = Slabs[Slab];
+		Out.NumInstances = Data.Num();
+		if (Data.IsEmpty())
+		{
+			continue;
+		}
+		if (!Out.Buffer)
+		{
+			Out.Buffer = AtlasPainterDetail::Renderer().CreateInstanceBuffer(Data.Num());
+		}
+		Budget -= int64(Data.Num()) * sizeof(FVector4f);
+		Out.Buffer->Update(Data);
 	}
 }
 
@@ -276,12 +358,10 @@ int32 FAtlasMapPainter::PaintRecipeIcons(UAtlasSubsystem& Atlas, FSlateWindowEle
 	return bDrew ? LayerId + 1 : LayerId - 1;
 }
 
-int32 FAtlasMapPainter::PaintPorts(UAtlasSubsystem& Atlas, EView View, FSlateWindowElementList& OutDrawElements, int32 LayerId,
-	FVector2f Origin, FVector2f Scale, const FSlateRect& CullingRect)
+namespace AtlasPortColors
 {
-	static const FSlateRoundedBoxBrush Disc(FLinearColor::White, 8.f);
-	// Belts: orange out, blue in. Pipes: greens. Hypertubes: violet. Tracks: pale grey.
-	const auto PortColor = [](const FPort& Port)
+	/** Belts: orange out, blue in. Pipes: greens. Hypertubes: violet. Tracks: pale grey. */
+	FLinearColor PortColor(const FPort& Port)
 	{
 		switch (Port.Kind)
 		{
@@ -294,7 +374,14 @@ int32 FAtlasMapPainter::PaintPorts(UAtlasSubsystem& Atlas, EView View, FSlateWin
 		default:
 			return Port.bOutput ? FLinearColor(1.f, 0.55f, 0.15f, 1.f) : FLinearColor(0.25f, 0.75f, 1.f, 1.f);
 		}
-	};
+	}
+}
+
+int32 FAtlasMapPainter::PaintPorts(UAtlasSubsystem& Atlas, EView View, FSlateWindowElementList& OutDrawElements, int32 LayerId,
+	FVector2f Origin, FVector2f Scale, const FSlateRect& CullingRect)
+{
+	static const FSlateRoundedBoxBrush Disc(FLinearColor::White, 8.f);
+	const auto PortColor = [](const FPort& Port) { return AtlasPortColors::PortColor(Port); };
 	const FLinearColor Edge(0.02f, 0.02f, 0.025f, 0.9f);
 	constexpr float NodeSize = 10.f;
 	constexpr float HotSize = 15.f;
@@ -303,7 +390,8 @@ int32 FAtlasMapPainter::PaintPorts(UAtlasSubsystem& Atlas, EView View, FSlateWin
 	const TArray<FPort>& Ports = Atlas.GetPorts();
 	const FBeltDrag& Drag = Atlas.GetBeltDrag();
 	const bool bDragging = Drag.bActive;
-	const int32 Hot = Atlas.GetPortUnderCursor(View);
+	// Placing, a port can't be dragged from, so none lights up under the cursor.
+	const int32 Hot = Atlas.IsPlacing(View) ? INDEX_NONE : Atlas.GetPortUnderCursor(View);
 	const auto ToScreen = [&](FVector2f Uv) { return Origin + Scale * Uv; };
 
 	const int32 NodeLayer = LayerId + 1;
@@ -411,6 +499,81 @@ int32 FAtlasMapPainter::PaintWire(const UAtlasSubsystem& Atlas, EView View, FSla
 	return LayerId + 4;
 }
 
+int32 FAtlasMapPainter::PaintPlace(const UAtlasSubsystem& Atlas, EView View, FSlateWindowElementList& OutDrawElements, int32 LayerId,
+	FVector2f Origin, FVector2f Scale) const
+{
+	static const FSlateColorBrush Fill(FLinearColor::White);
+	static const FSlateRoundedBoxBrush Disc(FLinearColor::White, 8.f);
+	const FPlaceTool& Place = Atlas.GetPlace();
+	if (!Place.Recipe)
+	{
+		return LayerId;
+	}
+	const auto ToScreen = [&](const FVector& Location)
+	{
+		return Origin + Scale * FVector2f(float((Location.X - MapWestCm) / MapWidthCm), float((Location.Y - MapNorthCm) / MapHeightCm));
+	};
+	const FLinearColor Pale(0.85f, 0.85f, 0.85f, 1.f);
+	const FLinearColor Good(0.35f, 0.92f, 0.45f, 1.f);
+	const FLinearColor Bad(1.f, 0.25f, 0.2f, 1.f);
+	const FLinearColor Edge(0.02f, 0.02f, 0.025f, 0.9f);
+	const FVector2f PixelsPerCm(FMath::Abs(Scale.X) / float(MapWidthCm), FMath::Abs(Scale.Y) / float(MapHeightCm));
+	// Never smaller than a few pixels, so the ghost stays visible zoomed out.
+	const FVector2f Half(FMath::Max(Place.GhostHalf.X * PixelsPerCm.X, 4.f), FMath::Max(Place.GhostHalf.Y * PixelsPerCm.Y, 4.f));
+	constexpr float NodeSize = 9.f;
+	constexpr float TickLength = 10.f;
+
+	// The footprint where the hologram has the building, with its belt, pipe and hypertube ports, so it can be lined
+	// up with what is already there.
+	const auto Ghost = [&](const FTransform& Transform, const FLinearColor& Color)
+	{
+		const FVector2f Center = ToScreen(Transform.TransformPosition(Place.GhostBoxCenter));
+		const float Yaw = FMath::DegreesToRadians(float(Transform.Rotator().Yaw));
+		const float Cos = FMath::Cos(Yaw);
+		const float Sin = FMath::Sin(Yaw);
+		const auto Corner = [&](float X, float Y) { return Center + FVector2f(X * Cos - Y * Sin, X * Sin + Y * Cos); };
+		const TArray<FVector2f> Outline = { Corner(-Half.X, -Half.Y), Corner(Half.X, -Half.Y), Corner(Half.X, Half.Y), Corner(-Half.X, Half.Y), Corner(-Half.X, -Half.Y) };
+		FSlateDrawElement::MakeRotatedBox(OutDrawElements, LayerId + 1, FPaintGeometry(Center - Half, Half * 2.f, 1.f), &Fill,
+			ESlateDrawEffect::None, Yaw, TOptional<FVector2f>(), FSlateDrawElement::RelativeToElement, Color.CopyWithNewOpacity(0.35f));
+		FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 2, FPaintGeometry(), Outline, ESlateDrawEffect::None, Edge, true, 4.f);
+		FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 3, FPaintGeometry(), Outline, ESlateDrawEffect::None, Color, true, 2.f);
+		for (const FPort& Port : Place.GhostPorts)
+		{
+			const FVector2f At = ToScreen(Transform.TransformPosition(Port.Location));
+			const FVector World = Transform.TransformVectorNoScale(Port.Normal);
+			const FVector2f Facing = FVector2f(float(World.X), float(World.Y)).GetSafeNormal();
+			const FLinearColor PortColor = AtlasPortColors::PortColor(Port);
+			if (!Facing.IsNearlyZero())
+			{
+				const TArray<FVector2f> Tick = { At, At + Facing * (NodeSize * 0.5f + TickLength) };
+				FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 4, FPaintGeometry(), Tick, ESlateDrawEffect::None, PortColor, true, 2.5f);
+			}
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 5, FPaintGeometry(At - FVector2f(NodeSize * 0.5f + 1.5f), FVector2f(NodeSize + 3.f), 1.f),
+				&Disc, ESlateDrawEffect::None, Edge);
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 6, FPaintGeometry(At - FVector2f(NodeSize * 0.5f), FVector2f(NodeSize), 1.f),
+				&Disc, ESlateDrawEffect::None, PortColor);
+		}
+	};
+
+	if (Place.bRow)
+	{
+		// Each spot of the row as the game judged it; built ones are on the map already.
+		for (const FPlaceSpot& Spot : Place.Row)
+		{
+			if (Spot.State != EPlaceSpot::Built)
+			{
+				Ghost(Spot.Ghost, Spot.State == EPlaceSpot::Valid ? Good : Spot.State == EPlaceSpot::Blocked ? Bad : Pale);
+			}
+		}
+	}
+	else if (Place.bHasGhost)
+	{
+		// Settled, the game's verdict colors it; until then it is pale.
+		Ghost(Place.GhostTransform, !Place.bReady ? Pale : Place.bValid ? Good : Bad);
+	}
+	return LayerId + 6;
+}
+
 int64 FAtlasMapPainter::DrawCells(const TArray<FCellBuffer>& Buffers, const FSlateResourceHandle& Handle, FSlateWindowElementList& OutDrawElements, int32 Layer,
 	const TArray<FSlateVertex>& Vertices, FVector2f Origin, FVector2f Scale, const FSlateRect& CullingRect) const
 {
@@ -479,7 +642,15 @@ int32 FAtlasMapPainter::Paint(UAtlasSubsystem& Atlas, EView View, FVector2f Orig
 	int64 DrawnInstances = 0;
 	if (bBuildings)
 	{
-		DrawnInstances += DrawCells(Cells, MaterialHandle, OutDrawElements, DrawLayer, Vertices, Origin, Scale, CullingRect);
+		// Lowest slab first. No culling: a slab spans the map, and off-screen quads cost the GPU next to nothing.
+		for (const FSlab& Slab : Slabs)
+		{
+			if (Slab.Buffer && Slab.NumInstances > 0)
+			{
+				FSlateDrawElement::MakeCustomVerts(OutDrawElements, DrawLayer, MaterialHandle, Vertices, Indices, Slab.Buffer.Get(), 0, uint32(Slab.NumInstances));
+				DrawnInstances += Slab.NumInstances;
+			}
+		}
 	}
 
 	int32 TopLayer = DrawLayer;
@@ -500,7 +671,8 @@ int32 FAtlasMapPainter::Paint(UAtlasSubsystem& Atlas, EView View, FVector2f Orig
 		TopLayer = PaintRecipeIcons(Atlas, OutDrawElements, TopLayer + 1, Origin, Scale, PixelsPerMetre, CullingRect);
 	}
 
-	if (bBuildings && StatusHandle.IsValid() && Atlas.GetStatusGrid() && !StatusCells.IsEmpty())
+	if (bBuildings && StatusHandle.IsValid() && Atlas.GetStatusGrid() && !StatusCells.IsEmpty()
+		&& PixelsPerMetre >= AtlasPainterDetail::StatusMinPixelsPerMetre)
 	{
 		TopLayer = TopLayer + 1;
 		DrawCells(StatusCells, StatusHandle, OutDrawElements, TopLayer, Vertices, Origin, Scale, CullingRect);
@@ -530,6 +702,53 @@ int32 FAtlasMapPainter::Paint(UAtlasSubsystem& Atlas, EView View, FVector2f Orig
 		}
 	}
 
+	if (Atlas.IsPicking(View))
+	{
+		// Buildings picked for dismantling, in red, or for a recipe change, in the accent colour.
+		uint32 Version = 0;
+		const TArray<FVector4f>& Picked = Atlas.GetDismantleRecords(Version);
+		UpdateBuffer(Picked, Version, DismantleVersion, DismantleCount, DismantleBuffer);
+		if (DismantleBuffer && DismantleCount > 0)
+		{
+			TopLayer = TopLayer + 1;
+			FSlateDrawElement::MakeCustomVerts(OutDrawElements, TopLayer, MaterialHandle, Vertices, Indices, DismantleBuffer.Get(), 0, uint32(DismantleCount));
+		}
+		// The power lines connect mode would build, in the power colour; those past what can be paid for, pale.
+		const FDismantleTool& Tool = Atlas.GetDismantle();
+		if (Atlas.IsConnecting(View) && !Tool.bPreview && !Tool.Power.Wires.IsEmpty())
+		{
+			const auto ToScreen = [&](const FVector& Location)
+			{
+				return Origin + Scale * FVector2f(float((Location.X - MapWestCm) / MapWidthCm), float((Location.Y - MapNorthCm) / MapHeightCm));
+			};
+			const FLinearColor Edge(0.02f, 0.02f, 0.025f, 0.9f);
+			const FLinearColor Power(1.f, 0.78f, 0.2f, 1.f);
+			const FLinearColor Unpaid(0.85f, 0.85f, 0.85f, 0.6f);
+			const TArray<FPlannedWire>& Wires = Tool.Power.Wires;
+			for (int32 Index = 0; Index < Wires.Num(); Index++)
+			{
+				const TArray<FVector2f> Line = { ToScreen(Wires[Index].FromLocation), ToScreen(Wires[Index].ToLocation) };
+				FSlateDrawElement::MakeLines(OutDrawElements, TopLayer + 1, FPaintGeometry(), Line, ESlateDrawEffect::None, Edge, true, 4.f);
+				FSlateDrawElement::MakeLines(OutDrawElements, TopLayer + 2, FPaintGeometry(), Line, ESlateDrawEffect::None,
+					Index < Tool.Power.Affordable ? Power : Unpaid, true, 2.f);
+			}
+			TopLayer += 2;
+		}
+	}
+
+	if (Atlas.IsUpgradeOpen())
+	{
+		// The belt line an upgrade would replace, in the accent colour.
+		uint32 Version = 0;
+		const TArray<FVector4f>& Line = Atlas.GetUpgradeRecords(Version);
+		UpdateBuffer(Line, Version, UpgradeVersion, UpgradeCount, UpgradeBuffer);
+		if (UpgradeBuffer && UpgradeCount > 0)
+		{
+			TopLayer = TopLayer + 1;
+			FSlateDrawElement::MakeCustomVerts(OutDrawElements, TopLayer, MaterialHandle, Vertices, Indices, UpgradeBuffer.Get(), 0, uint32(UpgradeCount));
+		}
+	}
+
 	if (Atlas.HasSelection())
 	{
 		UpdateSingle(Atlas.GetSelectionRecord(), SelectionRecord, bSelectionReady, SelectionBuffer);
@@ -538,21 +757,44 @@ int32 FAtlasMapPainter::Paint(UAtlasSubsystem& Atlas, EView View, FVector2f Orig
 	}
 
 	const FHover& Hover = Atlas.GetHover();
-	if (bHighlightHover && Hover.bValid && !Hover.bMarker && Atlas.GetSettings().bHighlight)
+	if (bHighlightHover && Hover.bValid && !Hover.bMarker && Atlas.GetSettings().bHighlight && !Atlas.IsPlacing(View))
 	{
 		UpdateSingle(Hover.Record, HighlightRecord, bHighlightReady, HighlightBuffer);
 		TopLayer = TopLayer + 1;
 		FSlateDrawElement::MakeCustomVerts(OutDrawElements, TopLayer, MaterialHandle, Vertices, Indices, HighlightBuffer.Get(), 0, 1);
 	}
 
-	// Wire mode hides the belt ports: a click there connects power, it doesn't start a belt.
+	// Wire and place mode hide the belt ports: a click there connects power or builds, it doesn't start a belt.
 	if (Atlas.IsWiring(View))
 	{
 		TopLayer = PaintWire(Atlas, View, OutDrawElements, TopLayer, Origin, Scale);
 	}
-	else if (PixelsPerMetre >= UAtlasSubsystem::PortMinPixelsPerMetre || Atlas.IsDraggingBelt())
+	else if (Atlas.IsPicking(View))
 	{
-		TopLayer = PaintPorts(Atlas, View, OutDrawElements, TopLayer, Origin, Scale, CullingRect);
+		// The box being dragged, red when it takes buildings out of the pick.
+		const FDismantleTool& Tool = Atlas.GetDismantle();
+		if (Tool.bBoxing)
+		{
+			const FVector2f A = Origin + Scale * (Tool.PressMetres / MapWidthMetres);
+			const FVector2f B = Origin + Scale * Atlas.GetMapCursorUv(View);
+			const TArray<FVector2f> Box = { A, FVector2f(B.X, A.Y), B, FVector2f(A.X, B.Y), A };
+			const FLinearColor Color = Tool.bRemove ? FLinearColor(0.6f, 0.75f, 1.f, 1.f) : FLinearColor(1.f, 0.3f, 0.25f, 1.f);
+			FSlateDrawElement::MakeLines(OutDrawElements, TopLayer + 1, FPaintGeometry(), Box, ESlateDrawEffect::None, FLinearColor(0.02f, 0.02f, 0.025f, 0.9f), true, 4.f);
+			FSlateDrawElement::MakeLines(OutDrawElements, TopLayer + 2, FPaintGeometry(), Box, ESlateDrawEffect::None, Color, true, 2.f);
+			TopLayer += 2;
+		}
+	}
+	else
+	{
+		// Placing, the free ports stay in view to line the building up with, but can't be dragged from.
+		if (PixelsPerMetre >= UAtlasSubsystem::PortMinPixelsPerMetre || Atlas.IsDraggingBelt())
+		{
+			TopLayer = PaintPorts(Atlas, View, OutDrawElements, TopLayer, Origin, Scale, CullingRect);
+		}
+		if (Atlas.IsPlacing(View))
+		{
+			TopLayer = PaintPlace(Atlas, View, OutDrawElements, TopLayer, Origin, Scale);
+		}
 	}
 
 	PaintSeconds += FPlatformTime::Seconds() - PaintStart;

@@ -17,7 +17,10 @@ public class FactoryAtlas : ModuleRules
 		// CreateInstanceBuffer is reached through the renderer module's interface at runtime, so only its
 		// header is needed. Linking it would break dedicated server builds, which ship without the module.
 		PrivateIncludePathModuleNames.Add("SlateRHIRenderer");
-		PrivateDependencyModuleNames.AddRange(new string[] { "ImageWrapper", "AbstractInstance" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "ImageWrapper", "AbstractInstance", "RenderCore" });
+
+		// Map exports are written as PNG a band at a time (AtlasPng.cpp), straight through zlib.
+		AddEngineThirdPartyPrivateStaticDependencies(Target, "zlib");
 
 		// Header stubs
 		PublicDependencyModuleNames.AddRange(new string[] {
